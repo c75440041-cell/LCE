@@ -16,13 +16,13 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-from . import qs_strategy as qs
-from .backtest import (DAY, TRAIN_FRAC, _line, clone, covered_days, env_text, load_candles, metrics, passes, split)
-from .config import clean_config
-from .main import Bot, to_dict
-from .risk import fmt_num
-from .telegram import esc
-from .tracker import cost_r, fmt_wr, resolve
+import qs_strategy as qs
+from backtest import (DAY, TRAIN_FRAC, _line, clone, covered_days, env_text, load_candles, metrics, passes, split)
+from config import clean_config
+from main import Bot, to_dict
+from risk import fmt_num
+from telegram import esc
+from tracker import cost_r, fmt_wr, resolve
 
 log = logging.getLogger("qs")
 

@@ -17,8 +17,8 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from . import indicators as ind
-from .strategy import Analysis, Signal
+import indicators as ind
+from strategy import Analysis, Signal
 
 NY = ZoneInfo("America/New_York")
 DAY_MS = 86_400_000

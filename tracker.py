@@ -63,6 +63,8 @@ class Stats:
         for k in ("net_win_r", "net_loss_r"):
             s.setdefault(k, 0.0)
         s.setdefault("total_r_net", 0.0)
+        s.setdefault("peak_r_net", 0.0)
+        s.setdefault("max_dd_r", 0.0)
         s.setdefault("by_kind", {})
         for k in self.KINDS:
             s["by_kind"].setdefault(k, {"w": 0, "l": 0})
@@ -107,6 +109,11 @@ class Stats:
             if net is not None:
                 self.s["total_r_net"] += net
                 self.s["net_win_r" if net > 0 else "net_loss_r"] += abs(net)
+                peak = max(float(self.s.get("peak_r_net") or 0.0), float(self.s["total_r_net"]))
+                self.s["peak_r_net"] = peak
+                dd = peak - float(self.s["total_r_net"])
+                if dd > float(self.s.get("max_dd_r") or 0.0):
+                    self.s["max_dd_r"] = dd
             events.append(dict(o, result=res, r=r, r_net=net))
         if events:
             self._save()
@@ -118,8 +125,10 @@ class Stats:
                            if s["by_kind"][k]["w"] + s["by_kind"][k]["l"] > 0)
         pf = _pf(s["net_win_r"], s["net_loss_r"])
         pf_t = "n/d" if s["wins"] + s["losses"] == 0 else f"{pf:.2f}"
+        dd = s.get("max_dd_r") or 0.0
+        dd_t = f" · DD máx {dd:.1f}R" if dd else ""
         return (f"Win rate: {fmt_wr(s['wins'], s['losses'])} · R bruto {s['total_r']:+.1f}"
-                f" · R neto {s['total_r_net']:+.1f} · PF neto {pf_t}"
+                f" · R neto {s['total_r_net']:+.1f} · PF neto {pf_t}{dd_t}"
                 f" · abiertas {len(s['open'])} · expiradas {s['expired']}" + (f"\n{kinds}" if kinds else ""))
 
 

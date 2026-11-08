@@ -26,6 +26,22 @@ class Telegram:
             ok &= self._post(text[i:i + 3900])
         return ok
 
+    def send_document(self, filename, content, caption=""):
+        """Envia un archivo (bytes) como documento. Nunca lanza."""
+        if not self.enabled:
+            log.info("[Telegram desactivado] documento %s (%d bytes)", filename, len(content))
+            return False
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{self.token}/sendDocument",
+                              data={"chat_id": self.chat, "caption": caption[:1000]},
+                              files={"document": (filename, content)}, timeout=60)
+            if not r.ok:
+                log.error("Telegram documento HTTP %s: %s", r.status_code, r.text[:200])
+            return r.ok
+        except requests.RequestException as e:
+            log.error("Telegram documento error: %s", e)
+            return False
+
     def _post(self, chunk):
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         body = {"chat_id": self.chat, "text": chunk, "parse_mode": "HTML", "disable_web_page_preview": True}
