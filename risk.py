@@ -56,7 +56,7 @@ class RiskGuard:
         if c.max_trades_day and self.r.get("day_trades", 0) >= c.max_trades_day:
             return False, f"maximo {c.max_trades_day} operaciones hoy"
         start = self.r.get("day_start_equity") or equity
-        if c.max_day_loss and equity <= start * (1.0 - c.max_day_loss / 100.0):
+        if c.max_day_loss and self.r.get("day_pnl", 0.0) <= -start * c.max_day_loss / 100.0:
             return False, f"perdida diaria maxima {c.max_day_loss}%"
         if time.time() < self.r.get("pause_until", 0):
             return False, "en pausa por perdidas seguidas"
@@ -66,10 +66,10 @@ class RiskGuard:
         self.r["day_trades"] = self.r.get("day_trades", 0) + 1
         self._save()
 
-    def on_close(self, pnl, risk_usdt=0.0):
+    def on_close(self, pnl):
         c = self.cfg
         self.r["day_pnl"] = self.r.get("day_pnl", 0.0) + pnl
-        if pnl < -0.3 * risk_usdt if risk_usdt > 0 else pnl < 0:   # igual que Pine: perdida > 0.3R
+        if pnl < 0:
             self.r["cons_losses"] = self.r.get("cons_losses", 0) + 1
             if c.max_cons_loss and self.r["cons_losses"] >= c.max_cons_loss:
                 self.r["pause_until"] = time.time() + c.pause_bars * c.bar_ms / 1000.0

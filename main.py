@@ -2,23 +2,19 @@
 y (segun TRADE_MODE) opera en demo/live. Un solo hilo ejecuta ordenes; el
 analisis de simbolos se paraleliza (solo lectura)."""
 import logging
-import math
 import sys
 import time
-from datetime import datetime, timezone
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from . import indicators as ind
-from . import strategy
-from .bingx import BingX, BingXError
-from .config import Config, INTERVAL_MS
-from .risk import RiskGuard, fmt_num, round_down, size_position
-from .state import State
-from .tracker import History, Stats, fmt_wr
-from .telegram import Telegram, esc
+import strategy
+from bingx import BingX, BingXError
+from config import Config, INTERVAL_MS
+from risk import RiskGuard, fmt_num, round_down, size_position
+from state import State
+from telegram import Telegram, esc
 
 log = logging.getLogger("lce")
 
@@ -39,22 +35,8 @@ class Bot:
         c = self.cfg
         self.tg = Telegram(c.tg_token, c.tg_chat)
         self.bx = BingX(c.api_key, c.api_secret, demo=c.demo)
-        self.state = State(c.state_dir, name=c.state_file)
+        self.state = State(c.state_dir)
         self.risk = RiskGuard(c, self.state)
-        # si cambia la configuracion de la estrategia, las estadisticas en vivo dejan de ser comparables: se reinician
-        meta, fp = self.state.get("meta", {}), c.fingerprint()
-        self.cfg_changed = None
-        if meta.get("fp") and meta["fp"] != fp:
-            old = Stats(self.state, c.fee_pct + c.slip_pct)
-            self.cfg_changed = old.summary()
-            self.state.put("stats_prev", old.s)
-            self.state.put("stats", {})
-        if meta.get("fp") != fp:
-            self.state.put("meta", {"fp": fp})
-        self.stats = Stats(self.state, c.fee_pct + c.slip_pct)
-        self.hist = History(c.fee_pct + c.slip_pct)
-        self._hist_done = False
-        self._hist_syms = 0
         self.trades = self.state.get("trades", {})
         self.sig_ts = self.state.get("signals", {})
         self.info, self.vol, self.universe = {}, {}, []
@@ -62,7 +44,6 @@ class Bot:
         self._htf_cache = {}
         self._lev_done, self._mt_done = set(), set()
         self.funnel_total = Counter()
-        self.skipped = Counter()
         self.cycles = self.signals_sent = 0
         self._last_hb = time.time()
         self._last_err_msg = 0.0
@@ -84,28 +65,38 @@ class Bot:
             miss = c.missing_for_trading()
             if miss:
                 raise SystemExit(f"Faltan variables para operar: {', '.join(miss)}")
-            self.bx.balance()                         # valida credenciales ya
+            if c.mode == "live":
+                probs = c.live_problems()
+                if not self.state.persistent:
+                    probs.append("sin Volume en /data: el estado se perderia al redeploy")
+                if probs:
+                    msg = "Live bloqueado: " + "; ".join(probs)
+                    self.tg.send("⛔ " + esc(msg))
+                    raise SystemExit(msg)
+            bal0 = self.bx.balance()                  # valida credenciales ya
+            if c.mode == "live" and bal0["equity"] <= 0:
+                raise SystemExit("Live bloqueado: equity 0 en BingX (cuenta de futuros sin fondos)")
             try:
                 if not self.bx.position_mode():
                     log.warning("Cuenta en modo one-way: activo hedge (requiere sin posiciones abiertas)")
                     self.bx.set_position_mode(True)
             except BingXError as e:
                 log.error("No pude fijar modo hedge: %s", e)
+            if c.mode == "live":
+                try:
+                    hedge_ok = self.bx.position_mode()
+                except BingXError:
+                    hedge_ok = False
+                if not hedge_ok:
+                    raise SystemExit("Live bloqueado: la cuenta no esta en modo hedge (cierra posiciones y activalo en BingX)")
             self.reconcile()
         self.refresh_universe(force=True)
         self.tg.send(
             f"🤖 <b>LCE bot iniciado</b> [{self.label()}]\n"
             f"TF {c.timeframe} · HTF {c.htf if c.use_htf else 'off'} · {len(self.universe)} símbolos\n"
             f"Endpoint: {esc(self.bx.base)}\n"
-            f"Riesgo {c.risk_pct}% · Lev {c.leverage}x · Máx pos {c.max_positions} ({c.max_per_side}/sentido)\n"
-            f"Protecciones: régimen {c.regime_symbol if c.regime_filter else 'off'} · pérdida diaria {c.max_day_loss}% · "
-            f"pausa tras {c.max_cons_loss} pérdidas · kill_switch {'ON' if c.kill_switch else 'off'}\n"
-            f"Preset: {c.preset} · config {c.fingerprint()}\n"
-            + (f"Variables fijadas: {', '.join(c.active_env()[:14])}\n" if c.active_env() else "Variables de estrategia: todas por defecto\n")
-            +
-            f"Estado persistente: {'sí' if self.state.persistent else 'NO (monta un Volume)'}"
-            + (f"\n♻️ Configuración cambiada: estadísticas en vivo reiniciadas.\nAnteriores: {self.cfg_changed}"
-               if self.cfg_changed else ""))
+            f"Riesgo {c.risk_pct}% · Lev {c.leverage}x · Máx pos {c.max_positions}\n"
+            f"Estado persistente: {'sí' if self.state.persistent else 'NO (monta un Volume)'}")
 
     def reconcile(self):
         """Compara trades guardados con posiciones reales del exchange."""
@@ -172,111 +163,66 @@ class Bot:
         try:
             d = to_dict(self.bx.klines(sym, c.timeframe, c.candles), c.bar_ms)
             if d is None or len(d["t"]) < 120:
-                return sym, "pocas_velas", None, None
+                return sym, "pocas_velas", None
             if int(time.time() * 1000) - (int(d["t"][-1]) + c.bar_ms) > 2 * c.bar_ms:
-                return sym, "datos_viejos", None, None
+                return sym, "datos_viejos", None
             htf = self._get_htf(sym) if c.use_htf else None
             mt = 10.0 ** (-self.info.get(sym, {}).get("pp", 8))
-            return sym, "ok", strategy.run(c, d, htf, mintick=mt), d
+            return sym, "ok", strategy.run(c, d, htf, mintick=mt)
         except Exception as e:                        # un simbolo malo no tumba el ciclo
             log.warning("analisis %s fallo: %s", sym, e)
-            return sym, "error", None, None
+            return sym, "error", None
 
     # ------------------------------------------------------------------ escaneo
     def scan(self):
-        """Analiza en paralelo y procesa cada simbolo en cuanto termina (las senales entran antes)."""
         c = self.cfg
         t0 = time.time()
         self.refresh_universe()
         funnel = Counter()
-        events = []
-        extra = set(self.trades) | self.stats.open_symbols()
-        syms = list(self.universe) + [x for x in extra if x not in self.universe and x in self.info]
         with ThreadPoolExecutor(max_workers=c.workers) as ex:
-            futs = [ex.submit(self.analyze_symbol, s_) for s_ in syms]
-            for fut in as_completed(futs):
-                sym, status, an, d = fut.result()
-                funnel[status] += 1
-                if status != "ok":
-                    continue
-                events.extend(self.stats.update(sym, d, c.signal_timeout_bars))
-                if not self._hist_done:
-                    self._hist_syms += 1
-                    for hs in an.signals:
-                        self.hist.add(hs, d, an.n, c.signal_timeout_bars)
-                dg = an.diag
-                funnel["brk"] += bool(dg.get("brk"))
-                funnel["rev"] += bool(dg.get("rev"))
-                funnel["cand"] += bool(dg.get("cand"))
-                funnel["cooldown"] += bool(dg.get("cooldown"))
-                if dg.get("blocked"):
-                    funnel["bloq_" + dg["blocked"]] += 1
-                try:
-                    if c.use_struct_exit and sym in self.trades:
-                        tr = self.trades[sym]
-                        if (tr["side"] == "LONG" and an.struct_break_dn) or (tr["side"] == "SHORT" and an.struct_break_up):
-                            self.close_trade(sym, "estructura rota en contra")
-                    if c.use_trail and sym in self.trades:
-                        self.trail_trade(sym, an)
-                    if an.signals and an.signals[-1].idx == an.n - 1:
-                        funnel["senales"] += 1
-                        self.handle_signal(sym, an.signals[-1])
-                except Exception:                    # noqa: BLE001 - un simbolo no tumba el ciclo
-                    log.exception("procesando %s", sym)
-        self.send_events(events)
-        if not self._hist_done:
-            self._hist_done = True
-            self.tg.send(self.hist.text(c.candles * c.bar_ms / 86_400_000, self._hist_syms))
+            results = list(ex.map(self.analyze_symbol, self.universe))
+        found = []
+        for sym, status, an in results:
+            funnel[status] += 1
+            if status != "ok":
+                continue
+            dg = an.diag
+            funnel["brk"] += bool(dg.get("brk"))
+            funnel["rev"] += bool(dg.get("rev"))
+            funnel["cand"] += bool(dg.get("cand"))
+            funnel["cooldown"] += bool(dg.get("cooldown"))
+            if dg.get("blocked"):
+                funnel["bloq_" + dg["blocked"]] += 1
+            if c.use_struct_exit and sym in self.trades:
+                tr = self.trades[sym]
+                if (tr["side"] == "LONG" and an.struct_break_dn) or (tr["side"] == "SHORT" and an.struct_break_up):
+                    self.close_trade(sym, "estructura rota en contra")
+            if an.signals and an.signals[-1].idx == an.n - 1:
+                found.append((sym, an.signals[-1]))
+        funnel["senales"] = len(found)
+        found.sort(key=lambda x: -x[1].rr)
+        for sym, sig in found:
+            self.handle_signal(sym, sig)
         self.cycles += 1
         self.funnel_total.update(funnel)
         log.info("Ciclo %d en %.1fs | %s", self.cycles, time.time() - t0, dict(funnel))
 
     # ------------------------------------------------------------------ senales
-    def send_events(self, events):
-        if not events:
-            return
-        def one(e):
-            ico = {"win": "✅", "loss": "❌", "expired": "⌛"}[e["result"]]
-            txt = {"win": "TP alcanzado", "loss": "SL alcanzado", "expired": "expirada sin resolver"}[e["result"]]
-            r = f" {e['r']:+.2f}R" if e["result"] != "expired" else ""
-            return f"{ico} {esc(e['sym'])} {e['side']} {e['kind']} · {txt}{r}"
-        lines = [one(e) for e in events]
-        if len(lines) > 6:
-            lines = lines[:6] + [f"… y {len(lines) - 6} más"]
-        self.tg.send("\n".join(lines) + "\n📊 " + self.stats.summary())
-
-    def format_signal(self, sym, sig):
-        c = self.cfg
-        pp = self.info.get(sym, {}).get("pp", 6)
-        pct = lambda x: abs(x - sig.entry) / sig.entry * 100
-        names = {"BO": "Ruptura", "RV": "Reversión en zona", "SW": "Barrido de liquidez"}
-        when = datetime.fromtimestamp((sig.time + c.bar_ms) / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        arrow = "🟢" if sig.side == "LONG" else "🔴"
-        lines = [f"{arrow} <b>{sig.side}</b> · <b>{esc(sym)}</b> · {c.timeframe} [{self.label()}]",
-                 f"Tipo: {names[sig.kind]} ({sig.kind})" + (f" · puntos {sig.score}" if c.use_score or c.size_by_score else ""),
-                 f"🕒 {when}",
-                 f"Entrada: <code>{fmt_num(sig.entry, pp)}</code>",
-                 f"🛑 SL: <code>{fmt_num(sig.sl, pp)}</code> (-{pct(sig.sl):.2f}%)",
-                 f"🎯 TP: <code>{fmt_num(sig.tp, pp)}</code> (+{pct(sig.tp):.2f}%)"]
-        if sig.tp1:
-            lines.append(f"🎯 TP1: <code>{fmt_num(sig.tp1, pp)}</code> ({c.tp1_pct:.0f}% de la posición)")
-        lines.append(f"R:R {sig.rr:.2f} · ATR {fmt_num(sig.atr, pp)}")
-        lines.append(f"HTF {c.htf}: {sig.htf} · Vol rel {sig.rel_vol:.1f}x · ADX {sig.adx:.0f}")
-        lines.append(f"Riesgo {c.risk_pct * sig.risk_mult:.2f}% del equity" + (f" · Lev {c.leverage}x" if self.trading else ""))
-        lines.append("📊 " + self.stats.summary())
-        h = self.hist
-        if h.w + h.l:
-            lines.append(f"🧪 Backtest reciente: {fmt_wr(h.w, h.l)} · R neto {h.nw - h.nl:+.1f}")
-        return "\n".join(lines)
-
     def handle_signal(self, sym, sig):
         if sig.time <= self.sig_ts.get(sym, 0):
             return
         self.sig_ts[sym] = sig.time
         self.state.put("signals", self.sig_ts)
         self.signals_sent += 1
-        self.stats.add_open(sym, sig)
-        msg = self.format_signal(sym, sig)
+        pp = self.info.get(sym, {}).get("pp", 6)
+        arrow = "🟢" if sig.side == "LONG" else "🔴"
+        pct = lambda x: abs(x - sig.entry) / sig.entry * 100
+        msg = (f"{arrow} <b>{sig.side}</b> · <b>{esc(sym)}</b> · {self.cfg.timeframe} · {sig.kind} [{self.label()}]\n"
+               f"Entrada: <code>{fmt_num(sig.entry, pp)}</code>\n"
+               f"SL: <code>{fmt_num(sig.sl, pp)}</code> (-{pct(sig.sl):.2f}%)\n"
+               f"TP: <code>{fmt_num(sig.tp, pp)}</code> (+{pct(sig.tp):.2f}%)\n"
+               + (f"TP1: <code>{fmt_num(sig.tp1, pp)}</code>\n" if sig.tp1 else "")
+               + f"R:R {sig.rr:.2f}")
         self.tg.send(msg)
         if self.trading:
             try:
@@ -286,28 +232,6 @@ class Bot:
                 self.tg.send(f"⛔ No ejecutada {esc(sym)}: {esc(e)}")
 
     # ------------------------------------------------------------------ ejecucion
-    def _skip(self, sym, key, detail=""):
-        """Operacion omitida por una proteccion: solo log + contador (el resumen va en el heartbeat)."""
-        self.skipped[key] += 1
-        log.info("%s no ejecutada: %s %s", sym, key, detail)
-
-    def regime(self):
-        """Regimen de BTC en el TF superior: bull / bear / neutral (None si no hay datos)."""
-        c = self.cfg
-        try:
-            d = self._get_htf(c.regime_symbol)
-        except BingXError:
-            return None
-        if d is None or len(d["t"]) < c.ema_slow + 2:
-            return None
-        ef, es = ind.ema(d["c"], c.ema_fast)[-1], ind.ema(d["c"], c.ema_slow)[-1]
-        px = d["c"][-1]
-        if ef > es and px > es:
-            return "bull"
-        if ef < es and px < es:
-            return "bear"
-        return "neutral"
-
     def _exit_side(self, side):
         return "SELL" if side == "LONG" else "BUY"
 
@@ -358,41 +282,35 @@ class Bot:
         if inf is None:
             return
         if c.kill_switch:
-            return self._skip(sym, "kill_switch")
+            self.tg.send(f"ℹ️ {esc(sym)} no ejecutada: KILL_SWITCH activo")
+            return
         if sym in self.trades:
             log.info("%s ya tiene operacion abierta", sym)
             return
         if len(self.trades) >= c.max_positions:
-            return self._skip(sym, "max_posiciones", f"({c.max_positions})")
-        if c.max_per_side and sum(1 for t_ in self.trades.values() if t_["side"] == sig.side) >= c.max_per_side:
-            return self._skip(sym, "max_por_sentido", f"({sig.side} {c.max_per_side})")
-        if c.regime_filter:
-            rg = self.regime()
-            if rg is None:
-                return self._skip(sym, "regimen_desconocido")
-            if (sig.side == "LONG" and rg == "bear") or (sig.side == "SHORT" and rg == "bull"):
-                return self._skip(sym, "contra_regimen_BTC", f"({sig.side} con BTC {rg})")
+            self.tg.send(f"ℹ️ {esc(sym)} no ejecutada: máximo de {c.max_positions} posiciones")
+            return
         bal = self.bx.balance()
         ok, why = self.risk.can_open(bal["equity"])
         if not ok:
-            return self._skip(sym, "limite_riesgo", why)
+            self.tg.send(f"ℹ️ {esc(sym)} no ejecutada: {why}")
+            return
         px = self.bx.price(sym)
         if px <= 0:
             return
-        sl_pct = abs(px - sig.sl) / px * 100.0
-        lims = [x for x in (c.max_sl_pct, c.max_sl_liq_frac * 100.0 / c.leverage if c.max_sl_liq_frac > 0 and c.leverage > 0 else 0) if x > 0]
-        if lims and sl_pct > min(lims):
-            return self._skip(sym, "sl_demasiado_lejos", f"(SL {sl_pct:.1f}% > {min(lims):.1f}%)")
         sgn = 1 if sig.side == "LONG" else -1
         risk_d = (px - sig.sl) * sgn
         reward = (sig.tp - px) * sgn
         if risk_d <= 0 or reward <= 0 or reward / risk_d < c.min_live_rr:
-            return self._skip(sym, "precio_movido", f"(R:R real {reward / risk_d if risk_d > 0 else 0:.2f})")
-        sz = size_position(bal["equity"], px, sig.sl, c.risk_pct * sig.risk_mult, c.max_lev, inf["qp"], inf["min_qty"], inf["min_usdt"])
+            self.tg.send(f"ℹ️ {esc(sym)} no ejecutada: el precio ya se movió (R:R real {reward / risk_d if risk_d > 0 else 0:.2f})")
+            return
+        sz = size_position(bal["equity"], px, sig.sl, c.risk_pct, c.max_lev, inf["qp"], inf["min_qty"], inf["min_usdt"])
         if not sz:
-            return self._skip(sym, "tamano_minimo")
+            self.tg.send(f"ℹ️ {esc(sym)} no ejecutada: tamaño por debajo del mínimo")
+            return
         if sz["notional"] / c.leverage > bal["available"] * 0.95:
-            return self._skip(sym, "margen_insuficiente")
+            self.tg.send(f"ℹ️ {esc(sym)} no ejecutada: margen disponible insuficiente")
+            return
         qty = sz["qty"]
         n1 = 0.0
         if c.use_partial and sig.tp1:
@@ -402,11 +320,16 @@ class Bot:
 
         # apalancamiento en AMBOS lados (hedge) y margen aislado, una vez por simbolo
         if sym not in self._lev_done:
+            lev_ok = 0
             for s in ("LONG", "SHORT"):
                 try:
                     self.bx.set_leverage(sym, s, c.leverage)
+                    lev_ok += 1
                 except BingXError as e:
                     log.warning("leverage %s %s: %s", sym, s, e)
+            if lev_ok == 0 and c.mode == "live":
+                self.tg.send(f"⛔ {esc(sym)} no ejecutada: no pude fijar el apalancamiento {c.leverage}x")
+                return
             self._lev_done.add(sym)
         if sym not in self._mt_done:
             try:
@@ -446,7 +369,7 @@ class Bot:
         self.trades[sym] = {
             "side": sig.side, "kind": sig.kind, "entry": avg, "sl": sig.sl, "tp": sig.tp, "tp1": sig.tp1 if n1 else None,
             "qty": fqty, "n1": n1, "atr": sig.atr, "risk_d": abs(avg - sig.sl), "opened": time.time(),
-            "risk_usdt": sz["risk_usdt"], "sl_id": sl_id, "tp_id": tp_id, "tp1_id": tp1_id, "tp1_done": False, "trail_ts": 0.0,
+            "sl_id": sl_id, "tp_id": tp_id, "tp1_id": tp1_id, "tp1_done": False, "trail_ts": 0.0,
         }
         self._save_trades()
         self.risk.on_open()
@@ -469,29 +392,6 @@ class Bot:
                 log.info("cancel SL viejo %s: %s", sym, e)
         return True
 
-    def trail_trade(self, sym, an):
-        """Trailing de Pine: SL = max(SL, hh3 - ATR*trailATR) (short: min(SL, ll3 + ATR*trailATR)), por vela cerrada."""
-        c = self.cfg
-        tr = self.trades.get(sym)
-        if not tr or not self.trading or math.isnan(an.hh3) or math.isnan(an.atr):
-            return
-        if c.use_partial and tr.get("n1") and not tr["tp1_done"]:
-            return
-        if tr["side"] == "LONG":
-            new = max(tr["sl"], an.hh3 - an.atr * c.trail_atr)
-            ok = new > tr["sl"] and new < an.last_close
-        else:
-            new = min(tr["sl"], an.ll3 + an.atr * c.trail_atr)
-            ok = new < tr["sl"] and new > an.last_close
-        if not ok:
-            return
-        try:
-            pos = [p for p in self.bx.positions(sym) if p["side"] == tr["side"]]
-            if pos and self._replace_sl(sym, tr, new, round_down(pos[0]["amt"], self.info[sym]["qp"])):
-                self._save_trades()
-        except BingXError as e:
-            log.warning("trail %s: %s", sym, e)
-
     def _finish_trade(self, sym, tr, reason=""):
         pnl = None
         try:
@@ -506,7 +406,7 @@ class Bot:
         self.trades.pop(sym, None)
         self._save_trades()
         if pnl is not None:
-            self.risk.on_close(pnl, tr.get("risk_usdt", 0.0))
+            self.risk.on_close(pnl)
         r = (pnl / (tr["risk_d"] * tr["qty"])) if pnl is not None and tr.get("risk_d") and tr.get("qty") else None
         self.tg.send(f"🏁 <b>Cerrada</b> {tr['side']} {esc(sym)} {('· ' + reason) if reason else ''}\n"
                      + (f"PnL realizado: {pnl:+.2f} USDT" + (f" ({r:+.2f} R)" if r is not None else "")
@@ -552,10 +452,18 @@ class Bot:
                     tr["tp1_done"] = True
                     self.tg.send(f"🎯 TP1 alcanzado {esc(sym)}")
                     if c.use_be:
-                        be = tr["entry"]
+                        be = tr["entry"] + sgn * tr["entry"] * (2 * c.fee_pct / 100.0)
                         if self._replace_sl(sym, tr, be, round_down(pos["amt"], inf["qp"])):
                             self.tg.send(f"🔒 SL a break-even {esc(sym)}")
                     self._save_trades()
+                if tr["tp1_done"] and c.use_trail and time.time() - tr["trail_ts"] > 60:
+                    mark = pos["mark"] or self.bx.price(sym)
+                    new_sl = mark - sgn * c.trail_atr * tr["atr"]
+                    better = (new_sl - tr["sl"]) * sgn >= 0.1 * tr["atr"]
+                    safe = (mark - new_sl) * sgn > 0
+                    if better and safe and self._replace_sl(sym, tr, new_sl, round_down(pos["amt"], inf["qp"])):
+                        tr["trail_ts"] = time.time()
+                        self._save_trades()
             except BingXError as e:
                 log.warning("manage %s: %s", sym, e)
 
@@ -573,10 +481,9 @@ class Bot:
             except BingXError:
                 pass
         self.tg.send(f"💓 LCE [{self.label()}] · ciclos {self.cycles} · señales {self.signals_sent} · abiertas {len(self.trades)}"
-                     f"{eq}\n📊 {self.stats.summary()}\n🛡 Omitidas por protecciones: {dict(self.skipped) or 'ninguna'}\nEmbudo: ok {f['ok']} · cand {f['cand']} · cooldown {f['cooldown']} · "
+                     f"{eq}\nEmbudo: ok {f['ok']} · cand {f['cand']} · cooldown {f['cooldown']} · "
                      f"sin_espacio {f['bloq_sin_espacio']} · errores {f['error']} · viejos {f['datos_viejos']}")
         self.funnel_total = Counter()
-        self.skipped = Counter()
 
     def run(self):
         c = self.cfg
@@ -604,39 +511,11 @@ class Bot:
             time.sleep(1.0)
 
 
-def idle(msg):
-    """Tras un backtest/volcado el servicio queda en espera (evita reinicios en bucle)."""
-    while True:
-        log.info(msg)
-        time.sleep(3600)
-
-
 def main():
     cfg = Config()
     logging.basicConfig(level=getattr(logging, cfg.log_level, logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s", stream=sys.stdout)
-    if cfg.strategy == "qs":
-        from .qs_bot import QSBot
-        bot_cls = QSBot
-    else:
-        bot_cls = Bot
-    if cfg.run_mode in ("backtest", "dump"):
-        if cfg.strategy == "qs":
-            from . import qs_bot as bt_mod
-            fns = (bt_mod.run_backtest, bt_mod.run_dump)
-        else:
-            from . import backtest as bt_mod
-            fns = (bt_mod.run_sweep, bt_mod.run_dump)
-        bot = bot_cls(cfg)
-        try:
-            (fns[0] if cfg.run_mode == "backtest" else fns[1])(bot)
-        except Exception as e:                       # noqa: BLE001
-            log.exception("fallo en %s", cfg.run_mode)
-            bot.tg.send(f"⛔ Error en {cfg.run_mode}: {esc(repr(e)[:300])}")
-        bot.tg.send("ℹ️ Terminado. Cambia RUN_MODE=bot en Railway para volver a las señales en vivo.")
-        idle(f"RUN_MODE={cfg.run_mode} terminado; pon RUN_MODE=bot")
-    else:
-        bot_cls(cfg).run()
+    Bot(cfg).run()
 
 
 if __name__ == "__main__":
