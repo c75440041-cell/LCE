@@ -1,4 +1,5 @@
-"""Construye la lista de símbolos a analizar: todas las criptos USDT-M + petróleo."""
+"""Construye la lista de símbolos a analizar: TODOS los perpetuos de BingX (USDT-M y USDC-M,
+criptos + petróleo + TradFi), salvo los que excluyas o estén fuera de línea."""
 from __future__ import annotations
 
 from typing import Any, Dict, List
@@ -35,7 +36,9 @@ def build_universe(contracts: List[Dict[str, Any]], volumes: Dict[str, float],
 
     for ct in contracts:
         sym = str(ct.get("symbol", "")).upper()
-        if not sym or sym in seen or sym in exclude or not sym.endswith("-USDT"):
+        if not sym or sym in seen or sym in exclude:
+            continue
+        if not any(sym.endswith("-" + q) for q in cfg.quote_assets):
             continue
         status = ct.get("status")
         if status is not None and _int_or_none(status) not in (1, None):

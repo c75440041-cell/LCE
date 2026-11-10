@@ -18,9 +18,10 @@ from backtest import backtest_symbol, make_symdata, simulate
 from config import load_config
 from messages import format_event, format_signal, format_startup, format_top
 from models import Candle, SymbolMeta
-from strategy import (MIN_BARS, RANK_WEIGHTS, build_series, cbc_against, evaluate, market_bias,
-                      select_top)
+from strategy import (MIN_BARS, RANK_WEIGHTS, base_of, build_series, cbc_against, evaluate,
+                      market_bias, select_top)
 from tracker import Tracker, cooldown_active
+from universe import build_universe
 
 DAY = 86_400_000
 LTF = 900_000  # 15m
@@ -79,6 +80,10 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.cooldown_bars, 4)
         self.assertTrue(cfg.market_bias)
         self.assertEqual(cfg.market_symbol, "BTC-USDT")
+        # por defecto analiza TODOS los pares: sin mínimo de volumen, con TradFi y con USDC-M
+        self.assertEqual(cfg.min_quote_volume, 0.0)
+        self.assertTrue(cfg.include_tradfi and cfg.include_oil)
+        self.assertEqual(cfg.quote_assets, ("USDT", "USDC"))
         with mock.patch.dict(os.environ, {"TOP_N": "2", "MIN_RANK": "140"}, clear=True):
             cfg = load_config()
         self.assertEqual((cfg.top_n, cfg.min_rank), (2, 100.0))  # MIN_RANK se acota a 0-100
@@ -400,6 +405,12 @@ class TestRanking(unittest.TestCase):
         self.assertLess(lo.rank, self._long_sig().rank)
         self.assertLess(self._long_sig().rank, hi.rank)
 
+    def test_dead_contract_gets_zero_liquidity_but_unknown_is_neutral(self):
+        dead, floor, unknown = self._long_sig(liq=0.0), self._long_sig(liq=1e6), self._long_sig(liq=None)
+        self.assertEqual(dead.rank, floor.rank)      # 0 y 1M USDT: ambos 0 puntos de liquidez
+        self.assertEqual(dead.rank_parts["liquidez"], 0)
+        self.assertEqual(unknown.rank_parts["liquidez"], 50)
+
     def test_short_mirrors_long(self):
         rows = downtrend()
         last = rows[-1]
@@ -458,6 +469,23 @@ class TestSelectTop(unittest.TestCase):
         unlimited, _, _ = select_top(sigs, mk_cfg(top_n=0), "rank")
         self.assertEqual(len(unlimited), 6)
 
+    def test_one_signal_per_underlying(self):
+        sigs = self._sigs([80, 70, 60, 50])
+        sigs = [replace(sigs[0], symbol="BTC-USDT"), replace(sigs[1], symbol="BTC-USDC"),
+                replace(sigs[2], symbol="ETH-USDT"), replace(sigs[3], symbol="ETH-USDC")]
+        chosen, _, cut = select_top(sigs, mk_cfg(top_n=4))
+        self.assertEqual([s.symbol for s in chosen], ["BTC-USDT", "ETH-USDT"])  # la mejor de cada subyacente
+        self.assertEqual(cut, 2)
+        self.assertEqual(base_of("1000PEPE-USDT"), "1000PEPE")
+
+    def test_busy_bases_are_skipped(self):
+        sigs = self._sigs([80, 70, 60])
+        sigs = [replace(sigs[0], symbol="BTC-USDC"), replace(sigs[1], symbol="SOL-USDT"),
+                replace(sigs[2], symbol="XRP-USDT")]
+        chosen, low, _ = select_top(sigs, mk_cfg(top_n=2), busy_bases={"BTC"})  # BTC ya está en operación
+        self.assertEqual([s.symbol for s in chosen], ["SOL-USDT", "XRP-USDT"])
+        self.assertEqual(low, 0)
+
     def test_top_summary_message(self):
         cfg = mk_cfg(top_n=4)
         chosen, _, _ = select_top(self._sigs([90, 80, 70]), cfg)
@@ -465,6 +493,34 @@ class TestSelectTop(unittest.TestCase):
         self.assertIn("TOP 3 entradas", txt)
         self.assertIn("1. 🟢", txt)
         self.assertIn("7 señales válidas entre 300 pares", txt)
+
+
+class TestUniverseAllSymbols(unittest.TestCase):
+    CONTRACTS = [
+        {"symbol": "BTC-USDT", "status": 1}, {"symbol": "BTC-USDC", "status": 1},
+        {"symbol": "TINY-USDT", "status": 1},                       # sin volumen
+        {"symbol": "DEAD-USDT", "status": 0},                       # fuera de línea
+        {"symbol": "NCCOOILWTI2USD-USDT", "status": 1},             # petróleo
+        {"symbol": "NCSKTSLA2USD-USDT", "status": 1},               # acción (TradFi)
+        {"symbol": "NCCOGOLD2USD-USDT", "status": 1},               # materia prima (TradFi)
+        {"symbol": "BTC-USD", "status": 1},                         # coin-M: otra API, no se admite
+    ]
+    VOLUMES = {"BTC-USDT": 3e8, "BTC-USDC": 1e8, "TINY-USDT": 2e4}
+
+    def test_default_includes_everything_tradable(self):
+        uni = build_universe(self.CONTRACTS, self.VOLUMES, mk_cfg())
+        self.assertEqual(set(uni), {"BTC-USDT", "BTC-USDC", "TINY-USDT", "NCCOOILWTI2USD-USDT",
+                                    "NCSKTSLA2USD-USDT", "NCCOGOLD2USD-USDT"})
+        self.assertEqual(uni["NCCOOILWTI2USD-USDT"].kind, "oil")
+        self.assertEqual(uni["NCSKTSLA2USD-USDT"].kind, "tradfi")
+
+    def test_filters_still_work_when_asked(self):
+        uni = build_universe(self.CONTRACTS, self.VOLUMES, mk_cfg(min_quote_volume=1e6, include_tradfi=False))
+        self.assertNotIn("TINY-USDT", uni)
+        self.assertNotIn("NCSKTSLA2USD-USDT", uni)
+        self.assertIn("NCCOOILWTI2USD-USDT", uni)
+        uni = build_universe(self.CONTRACTS, self.VOLUMES, mk_cfg(quote_assets=("USDT",)))
+        self.assertNotIn("BTC-USDC", uni)
 
 
 class TestCooldown(unittest.TestCase):

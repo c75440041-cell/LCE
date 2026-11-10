@@ -11,7 +11,7 @@ from bingx import BingXClient
 from config import Config
 from messages import format_event, format_signal, format_top
 from models import Candle, Signal, SymbolMeta
-from strategy import MIN_BARS, build_series, evaluate, market_bias, select_top
+from strategy import MIN_BARS, base_of, build_series, evaluate, market_bias, select_top
 from telegram import Telegram
 from tracker import Tracker
 from universe import build_universe
@@ -27,6 +27,7 @@ class Scanner:
         self.tracker = tracker
         self.universe: Dict[str, SymbolMeta] = {}
         self._universe_ts = 0.0
+        self._has_volumes = False  # ¿hay ticker 24h? (si no, la liquidez puntúa neutra en el ranking)
         self.ltf_ms = cfg.ltf_sec * 1000
         # Velas necesarias: ~2.3 días (para PDH/PDL) y mínimo 500, máx. 1440 (límite BingX)
         self.limit = min(1440, max(500, int(2.3 * 86400 / cfg.ltf_sec) + 40))
@@ -44,6 +45,7 @@ class Scanner:
         if not uni:
             raise RuntimeError("Universo vacío: revisa la conexión con BingX / filtros")
         self.universe = uni
+        self._has_volumes = bool(volumes)
         self._universe_ts = time.time()
         n_c = sum(1 for m in uni.values() if m.kind == "crypto")
         oil = [m.symbol for m in uni.values() if m.kind == "oil"]
@@ -130,8 +132,10 @@ class Scanner:
                 continue
 
             # 2) señal nueva en la última vela cerrada
-            sig, why = evaluate(S, len(closed) - 1, cfg, sym,
-                                liq=self.universe[sym].quote_volume, bias=bias)
+            meta = self.universe[sym]
+            liq = meta.quote_volume if (self._has_volumes or meta.quote_volume > 0) else None
+            sig, why = evaluate(S, len(closed) - 1, cfg, sym, liq=liq,
+                                bias=bias if meta.kind == "crypto" else 0)  # BTC no dice nada de oro/forex/acciones
             if sig is None:
                 rejects[why] += 1
                 continue
@@ -153,7 +157,8 @@ class Scanner:
             candidates.append(sig)
 
         # TOP-N: de todas las señales válidas de este cierre solo se envían las N de mayor ranking
-        chosen, low_rank, cut = select_top(candidates, cfg)
+        busy = {base_of(s) for s in self.tracker.trades}  # subyacentes con operación abierta
+        chosen, low_rank, cut = select_top(candidates, cfg, busy_bases=busy)
         if low_rank:
             rejects["rank_bajo"] += low_rank
         if cut:

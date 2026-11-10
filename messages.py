@@ -190,7 +190,8 @@ def format_startup(cfg: Config, n_crypto: int, oil: list, n_other: int) -> str:
         f"⏱ LTF {cfg.ltf} · HTF {cfg.htf} · confluencia mín. {cfg.min_score}/4",
         (f"🏆 Cada cierre de {cfg.ltf}: solo las {cfg.top_n} mejores entradas por ranking (mín. {cfg.min_rank:g}/100)"
          if cfg.top_n > 0 else f"🏆 Todas las señales con ranking ≥ {cfg.min_rank:g}/100"),
-        f"🪙 {n_crypto} criptos · 🛢 Petróleo: {esc(oil_txt)}" + (f" · +{n_other} otros" if n_other else ""),
+        f"🔭 Analiza {n_crypto + len(oil) + n_other} pares de BingX",
+        f"🪙 {n_crypto} criptos · 🛢 Petróleo: {esc(oil_txt)}" + (f" · +{n_other} otros (TradFi/extra)" if n_other else ""),
         f"🎯 TP: {' / '.join(f'{r:g}R' for r in cfg.tp_r)} · SL = flip CBC contrario (ATR {cfg.min_sl_atr:g}–{cfg.max_sl_atr:g}x)",
         "Recibirás señales al cierre de cada vela " + cfg.ltf + ".",
     ])

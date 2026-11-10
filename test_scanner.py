@@ -171,6 +171,33 @@ class TestLiveLoop(unittest.TestCase):
         self.assertEqual(sc.market_bias_for(None, now_ms), 0)
         self.assertEqual(sc.market_bias_for(series_ending_at(boundary)[-30:], now_ms), 0)  # pocas velas
 
+    def test_btc_bias_only_applies_to_crypto(self):
+        """Mismo par de señales; con BTC bajista el LONG cripto pierde puntos y el LONG TradFi no."""
+        cfg = mk_cfg(market_bias=True, top_n=4)
+        boundary = (NOW0 * 1000 // LTF) * LTF
+        bingx, tg = FakeBingX(), FakeTG()
+        sc = Scanner(cfg, bingx, tg, Tracker(cfg))
+        down = []
+        for k in range(300):
+            t = boundary - (300 - k) * LTF
+            o = 300 - 0.5 * k
+            down.append(Candle(t, o, o + 0.1, o - 0.9, o - 0.8, 1000.0))
+        bingx.candles["BTC-USDT"] = down
+        bingx.candles["ALT-USDT"] = self._red_pullback(boundary)
+        bingx.candles["NCSKTSLA2USD-USDT"] = self._red_pullback(boundary)
+        sc.universe = {"BTC-USDT": SymbolMeta("BTC-USDT", price_prec=2),
+                       "ALT-USDT": SymbolMeta("ALT-USDT", price_prec=2, quote_volume=5e7),
+                       "NCSKTSLA2USD-USDT": SymbolMeta("NCSKTSLA2USD-USDT", kind="tradfi", price_prec=2,
+                                                       quote_volume=5e7)}
+        sc._universe_ts = 1e18
+        with mock.patch("time.time", return_value=boundary / 1000 + 5):
+            asyncio.run(sc.scan_once())
+        by_sym = {m.split("· ")[1].split("<")[0].split()[0]: m for m in tg.sent if "Ranking #" in m}
+        self.assertIn("ALT-USDT", by_sym)
+        self.assertIn("NCSKTSLA2USD-USDT", by_sym)
+        self.assertIn("Mercado 0%", by_sym["ALT-USDT"])            # LONG contra un BTC bajista
+        self.assertIn("Mercado 50%", by_sym["NCSKTSLA2USD-USDT"])  # TradFi: BTC no aplica (neutro)
+
     def test_no_signal_on_green_candle(self):
         cfg = mk_cfg()
         boundary = (NOW0 * 1000 // LTF) * LTF

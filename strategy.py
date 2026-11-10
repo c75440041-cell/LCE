@@ -274,7 +274,8 @@ def rank_parts(S: Series, i: int, is_long: bool, *, score: int, risk: float, atr
     body = abs(S.c[i] - S.o[i])
     vela = 0.6 * _clamp01(pos) + 0.4 * (1.0 - _clamp01(body / (1.5 * atr)))
 
-    liquidez = 0.5 if (not liq or liq <= 0) else _clamp01(math.log10(liq / 1e6) / 3.0)
+    # liq=None -> desconocida (neutra). liq=0 -> contrato muerto (0 puntos)
+    liquidez = 0.5 if liq is None else _clamp01(math.log10(max(liq, 1.0) / 1e6) / 3.0)
     mercado = 0.5 if bias == 0 else (1.0 if (bias > 0) == is_long else 0.0)
 
     return {
@@ -284,23 +285,38 @@ def rank_parts(S: Series, i: int, is_long: bool, *, score: int, risk: float, atr
     }
 
 
-def select_top(cands: List[Signal], cfg: Config, mode: str = "rank",
-               rng=None) -> Tuple[List[Signal], int, int]:
+def base_of(symbol: str) -> str:
+    """Activo subyacente de un símbolo de BingX: BTC-USDT y BTC-USDC -> 'BTC'."""
+    return symbol.split("-")[0]
+
+
+def select_top(cands: List[Signal], cfg: Config, mode: str = "rank", rng=None,
+               busy_bases=()) -> Tuple[List[Signal], int, int]:
     """Elige las mejores señales de UN cierre de vela. Devuelve (elegidas, bajo_ranking_mínimo, recortadas).
+
+    Nunca elige dos señales del mismo subyacente (BTC-USDT y BTC-USDC serían la misma apuesta), ni
+    del subyacente de una operación ya abierta (`busy_bases`): así los 4 puestos son 4 ideas distintas.
 
     mode="rank"   -> las TOP_N de mayor ranking (lo que hace el bot en vivo)
     mode="random" -> TOP_N al azar entre las que superan MIN_RANK (línea base para el backtest)
     mode="all"    -> todas las que superan MIN_RANK, sin límite (línea base para el backtest)
     """
-    pool = [s for s in cands if s.rank >= cfg.min_rank]
-    low = len(cands) - len(pool)
+    eligible = [s for s in cands if base_of(s.symbol) not in busy_bases]
+    pool = [s for s in eligible if s.rank >= cfg.min_rank]
+    low = len(eligible) - len(pool)
     if mode == "random":
         (rng if rng is not None else random).shuffle(pool)
     else:
         pool.sort(key=lambda s: (s.rank, s.score, s.rvol), reverse=True)
+    uniq, seen = [], set()
+    for s in pool:  # una sola señal por subyacente (la primera = la mejor)
+        b = base_of(s.symbol)
+        if b not in seen:
+            seen.add(b)
+            uniq.append(s)
     if mode == "all" or cfg.top_n <= 0:
-        return pool, low, 0
-    chosen = pool[:cfg.top_n]
+        return uniq, low, len(pool) - len(uniq)
+    chosen = uniq[:cfg.top_n]
     return chosen, low, len(pool) - len(chosen)
 
 

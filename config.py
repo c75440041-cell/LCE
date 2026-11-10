@@ -103,6 +103,7 @@ class Config:
     tradfi_prefixes: Tuple[str, ...]
     extra_symbols: Tuple[str, ...]
     exclude_symbols: Tuple[str, ...]
+    quote_assets: Tuple[str, ...]  # monedas de cotización admitidas (USDT-M y USDC-M)
     # Riesgo (solo para calcular tamaño sugerido en el mensaje)
     account_usdt: float
     risk_pct: float
@@ -168,14 +169,15 @@ def load_config() -> Config:
         cooldown_bars=max(0, _int("COOLDOWN_BARS", 4)),
         market_bias=_bool("USE_MARKET_BIAS", True),
         market_symbol=_env("MARKET_SYMBOL", "BTC-USDT").upper(),
-        min_quote_volume=max(0.0, _float("MIN_QUOTE_VOLUME_USDT", 1_000_000.0)),
+        min_quote_volume=max(0.0, _float("MIN_QUOTE_VOLUME_USDT", 0.0)),
         max_symbols=max(0, _int("MAX_SYMBOLS", 0)),
         include_oil=_bool("INCLUDE_OIL", True),
-        include_tradfi=_bool("INCLUDE_TRADFI", False),
+        include_tradfi=_bool("INCLUDE_TRADFI", True),
         oil_keywords=_list("OIL_KEYWORDS", "OILWTI,OILBRENT,WTI,BRENT,CRUDE,OIL"),
         tradfi_prefixes=_list("TRADFI_PREFIXES", "NCCO,NCFX,NCSK,NCSI"),
         extra_symbols=_list("EXTRA_SYMBOLS", ""),
         exclude_symbols=_list("EXCLUDE_SYMBOLS", ""),
+        quote_assets=_list("QUOTE_ASSETS", "USDT,USDC"),
         account_usdt=max(0.0, _float("ACCOUNT_USDT", 0.0)),
         risk_pct=max(0.0, _float("RISK_PCT", 1.0)),
         requests_per_second=max(1.0, _float("REQUESTS_PER_SECOND", 10.0)),

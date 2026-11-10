@@ -38,9 +38,10 @@ except ImportError:
 from bingx import BingXClient
 from config import Config, load_config
 from models import Candle, Trade
-from strategy import MIN_BARS, Series, build_series, cbc_against, evaluate, market_bias, select_top
+from strategy import (MIN_BARS, Series, base_of, build_series, cbc_against, evaluate, market_bias,
+                      select_top)
 from tracker import close_trade_at, cooldown_active, new_trade, step_trade
-from universe import build_universe
+from universe import build_universe, classify
 
 
 @dataclass
@@ -49,11 +50,13 @@ class SymData:
     candles: List[Candle]
     S: Series
     idx: Dict[int, int]  # hora de apertura de la vela -> posición
-    liq: float = 0.0     # volumen 24h en USDT (solo para el ranking)
+    liq: Optional[float] = None  # volumen 24h en USDT (solo para el ranking; None = desconocido)
+    kind: str = "crypto"         # crypto | oil | tradfi: el sesgo de BTC solo se aplica a criptos
 
 
-def make_symdata(symbol: str, candles: List[Candle], cfg: Config, liq: float = 0.0) -> SymData:
-    return SymData(symbol, candles, build_series(candles, cfg), {c.t: k for k, c in enumerate(candles)}, liq)
+def make_symdata(symbol: str, candles: List[Candle], cfg: Config, liq: Optional[float] = None) -> SymData:
+    return SymData(symbol, candles, build_series(candles, cfg), {c.t: k for k, c in enumerate(candles)},
+                   liq, classify(symbol, cfg))
 
 
 async def fetch_history(bingx: BingXClient, symbol: str, interval: str, ltf_ms: int, days: float) -> List[Candle]:
@@ -129,7 +132,7 @@ def simulate(data: Dict[str, SymData], cfg: Config, fee_rate: float, eval_from_m
                     tr = None
             if i < max(MIN_BARS, 3):
                 continue
-            sig, _ = evaluate(d.S, i, cfg, sym, liq=d.liq, bias=bias)
+            sig, _ = evaluate(d.S, i, cfg, sym, liq=d.liq, bias=bias if d.kind == "crypto" else 0)
             if sig is None:
                 continue
             if cooldown_active(last_close.get(sym), sig.t, ltf_ms, cfg.cooldown_bars):
@@ -141,7 +144,7 @@ def simulate(data: Dict[str, SymData], cfg: Config, fee_rate: float, eval_from_m
                 del active[sym]
             cands.append(sig)
 
-        chosen, low, cut = select_top(cands, cfg, mode, rng)
+        chosen, low, cut = select_top(cands, cfg, mode, rng, {base_of(s) for s in active})
         info["candidatas"] += len(cands)
         info["elegidas"] += len(chosen)
         info["bajo_ranking"] += low
@@ -243,7 +246,7 @@ async def amain(args: argparse.Namespace) -> None:
             if len(candles) < MIN_BARS + 50:
                 print(f"[{n}/{len(symbols)}] {sym}: pocas velas ({len(candles)})")
                 continue
-            data[sym] = make_symdata(sym, candles, cfg, volumes.get(sym, 0.0))
+            data[sym] = make_symdata(sym, candles, cfg, volumes.get(sym, 0.0) if volumes else None)
             print(f"[{n}/{len(symbols)}] {sym}: {len(candles)} velas")
         market = data.get(cfg.market_symbol)
         if cfg.market_bias and market is None:

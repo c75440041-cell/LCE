@@ -59,13 +59,16 @@ USE_MARKET_BIAS=true
 MARKET_SYMBOL=BTC-USDT
 
 # ===================== UNIVERSO =====================
-# Volumen 24h mínimo (USDT) para analizar una cripto
-MIN_QUOTE_VOLUME_USDT=1000000
+# Por defecto analiza TODOS los perpetuos de BingX. El ranking ya penaliza los poco líquidos (8 pts),
+# pero si te salen señales de pares sin volumen, sube este mínimo (p.ej. 1000000 = 1M USDT en 24h)
+MIN_QUOTE_VOLUME_USDT=0
 # 0 = todas las que pasen el filtro de volumen
 MAX_SYMBOLS=0
 INCLUDE_OIL=true
-# Otras materias primas / acciones / forex de BingX (NCCO*, NCFX*, NCSK*...). Normalmente false
-INCLUDE_TRADFI=false
+# Materias primas / acciones / forex de BingX (NCCO*, NCFX*, NCSK*...). true = también se analizan
+INCLUDE_TRADFI=true
+# Monedas de cotización admitidas: USDT-M y USDC-M (BTC-USDT y BTC-USDC cuentan como UNA sola idea en el TOP)
+QUOTE_ASSETS=USDT,USDC
 # Símbolos extra exactos de BingX separados por coma (p.ej. oro) o excluir los que no quieras
 EXTRA_SYMBOLS=
 EXCLUDE_SYMBOLS=
