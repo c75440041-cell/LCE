@@ -1,0 +1,85 @@
+# ===================== OBLIGATORIAS =====================
+TELEGRAM_BOT_TOKEN=123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# Tu chat id (o varios separados por coma). Grupos/canales empiezan por -100...
+TELEGRAM_CHAT_ID=123456789
+
+# ===================== ESTRATEGIA =====================
+# pullback = CBC VERDE -> compra velas ROJAS · CBC ROJO -> vende velas VERDES (retrocesos dentro de la tendencia CBC)
+# flip     = estrategia original: entra cuando nace el acuerdo CBC LTF + HTF
+STRATEGY=pullback
+# pullback: exige además que el CBC del HTF vaya en la misma dirección (false = solo manda el CBC del LTF)
+PULLBACK_REQUIRE_HTF=false
+# pullback: cierra la operación cuando el CBC del LTF cambia de color en contra (al cierre de la vela)
+EXIT_ON_CBC_FLIP=true
+
+# ===================== TIMEFRAMES =====================
+# Válidos en BingX: 1m 3m 5m 15m 30m 1h 2h 4h 6h 8h 12h 1d  (HTF debe ser múltiplo de LTF)
+# LTF = timeframe donde se lee el CBC y las velas rojas/verdes. HTF = nube EMA de confluencia (y filtro opcional)
+LTF=15m
+HTF=1h
+# true = el HTF incluye la vela en formación (como el indicador en vivo). false = solo HTF cerrado (más lento)
+HTF_USE_FORMING=true
+
+# ===================== SEÑAL / FILTROS =====================
+# Confluencias mínimas (0-4): EMA9/20 LTF, VWAP, EMA200, EMA9/20 HTF
+# (0 = regla pura "CBC verde + vela roja", sin filtro de tendencia: muchas más señales)
+MIN_SCORE=3
+# Stop = extremo de la vela de señal (flip CBC contrario) +/- colchón ATR, acotado a [MIN,MAX] x ATR
+ATR_PERIOD=14
+SL_BUFFER_ATR=0.15
+MIN_SL_ATR=0.8
+MAX_SL_ATR=2.5
+# true = descarta señales cuyo stop natural sea más ancho que MAX_SL_ATR (entrada tardía)
+SKIP_WIDE_SL=true
+# Objetivos en múltiplos de R y % de la posición que se cierra en cada uno
+TP_R=1,2,3
+TP_SPLIT=40,30,30
+# Espacio mínimo (en R) hasta PDH/PDL/PDC del día anterior. 0 = desactivar
+MIN_ROOM_R=1.0
+MOVE_SL_TO_BE=true
+# Cierra también si aparece una señal contraria (con EXIT_ON_CBC_FLIP=true casi nunca llega a usarse)
+EXIT_ON_OPPOSITE=true
+# Horas máximas de una operación (0 = sin límite)
+MAX_TRADE_HOURS=24
+# Avisos de TP / SL / salida de cada señal enviada
+TRACK_TRADES=true
+
+# ===================== SELECCIÓN TOP-N (cada cierre de vela LTF) =====================
+# De TODAS las señales válidas del cierre, el bot puntúa cada una (0-100) y envía solo las TOP_N mejores.
+# Puntuación = confluencia + CBC HTF + tendencia limpia + retroceso a zona de valor (EMA20) + espacio libre
+#              + stop ajustado + vela de rechazo + liquidez + alineación con BTC (pesos en strategy.RANK_WEIGHTS)
+# Cuántas señales como máximo por cierre de vela (0 = sin límite)
+TOP_N=4
+# Ranking mínimo (0-100): si hay menos de TOP_N por encima de este valor, se envían menos (no se rellena con malas)
+MIN_RANK=50
+# Velas de espera en un par tras cerrar una operación NO ganadora (SL / BE / flip en pérdida). 0 = sin espera
+COOLDOWN_BARS=4
+# true = el ranking premia las señales alineadas con el CBC + nube EMA del mercado de referencia
+USE_MARKET_BIAS=true
+MARKET_SYMBOL=BTC-USDT
+
+# ===================== UNIVERSO =====================
+# Volumen 24h mínimo (USDT) para analizar una cripto
+MIN_QUOTE_VOLUME_USDT=1000000
+# 0 = todas las que pasen el filtro de volumen
+MAX_SYMBOLS=0
+INCLUDE_OIL=true
+# Otras materias primas / acciones / forex de BingX (NCCO*, NCFX*, NCSK*...). Normalmente false
+INCLUDE_TRADFI=false
+# Símbolos extra exactos de BingX separados por coma (p.ej. oro) o excluir los que no quieras
+EXTRA_SYMBOLS=
+EXCLUDE_SYMBOLS=
+
+# ===================== TAMAÑO SUGERIDO (opcional) =====================
+# Si pones tu capital, cada señal incluye tamaño de posición para arriesgar RISK_PCT %
+ACCOUNT_USDT=0
+RISK_PCT=1
+
+# ===================== TÉCNICAS =====================
+REQUESTS_PER_SECOND=10
+CONCURRENCY=20
+SCAN_DELAY_SEC=4
+UNIVERSE_REFRESH_MIN=60
+# En Railway con Volume montado en /data usa: STATE_FILE=/data/state.json
+STATE_FILE=state.json
+LOG_LEVEL=INFO

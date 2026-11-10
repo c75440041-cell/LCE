@@ -1,751 +1,106 @@
-"""LCE bot: escanea BingX (perpetuos USDT) cada vela de 5m, envia senales a Telegram
-y (segun TRADE_MODE) opera en demo/live. Un solo hilo ejecuta ordenes; el
-analisis de simbolos se paraleliza (solo lectura)."""
+"""Punto de entrada.
+
+  python main.py                      -> bot en marcha (Railway)
+  python main.py --once --dry-run     -> un análisis ahora mismo, imprime señales en consola
+  python main.py --test-telegram      -> envía un mensaje de prueba a Telegram
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
 import logging
-import math
 import signal
 import sys
-import threading
-import time
-from datetime import datetime, timezone
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 
-import numpy as np
+import aiohttp
 
-import indicators as ind
-import strategy
-from bingx import BingX, BingXError
-from config import Config, INTERVAL_MS
-from risk import RiskGuard, fmt_num, round_down, size_position
-from state import State
-from tracker import History, Stats, fmt_wr
-from telegram import Telegram, esc
+try:  # opcional: leer .env en local
+    from dotenv import load_dotenv
 
-log = logging.getLogger("lce")
+    load_dotenv()
+except ImportError:
+    pass
 
-
-def to_dict(rows, bar_ms, now_ms=None):
-    """Lista de tuplas -> dict de arrays, descartando la vela en formacion."""
-    now_ms = now_ms or int(time.time() * 1000)
-    rows = [r for r in rows if r[0] + bar_ms <= now_ms]
-    if not rows:
-        return None
-    a = np.asarray(rows, float)
-    return {"t": a[:, 0].astype(np.int64), "o": a[:, 1], "h": a[:, 2], "l": a[:, 3], "c": a[:, 4], "v": a[:, 5]}
+from bingx import BingXClient
+from config import load_config
+from messages import format_startup
+from scanner import Scanner
+from telegram import Telegram
+from tracker import Tracker
 
 
-class Bot:
-    def __init__(self, cfg=None):
-        self.cfg = cfg or Config()
-        c = self.cfg
-        self.tg = Telegram(c.tg_token, c.tg_chat)
-        self.bx = BingX(c.api_key, c.api_secret, demo=c.demo)
-        self.state = State(c.state_dir, name=c.state_file)
-        self.risk = RiskGuard(c, self.state)
-        # si cambia la configuracion de la estrategia, las estadisticas en vivo dejan de ser comparables: se reinician
-        meta, fp = self.state.get("meta", {}), c.fingerprint()
-        self.cfg_changed = None
-        if meta.get("fp") and meta["fp"] != fp:
-            old = Stats(self.state, c.fee_pct + c.slip_pct)
-            self.cfg_changed = old.summary()
-            self.state.put("stats_prev", old.s)
-            self.state.put("stats", {})
-        if meta.get("fp") != fp:
-            self.state.put("meta", {"fp": fp})
-        self.stats = Stats(self.state, c.fee_pct + c.slip_pct)
-        self.hist = History(c.fee_pct + c.slip_pct)
-        self._hist_done = False
-        self._hist_syms = 0
-        self.trades = self.state.get("trades", {})
-        self.sig_ts = self.state.get("signals", {})
-        self.info, self.vol, self.universe = {}, {}, []
-        self._uni_exp = 0.0
-        self._htf_cache = {}
-        self._lev_done, self._mt_done = set(), set()
-        self.funnel_total = Counter()
-        self.skipped = Counter()
-        self.cycles = self.signals_sent = 0
-        self._last_hb = time.time()
-        self._last_err_msg = 0.0
-        self.trading = c.mode in ("demo", "live")
-        self._trade_lock = threading.Lock()   # protege trades / open / close (analisis es solo lectura)
-        self._stop = threading.Event()        # apagado limpio (SIGTERM/SIGINT)
+async def amain(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    if args.dry_run:
+        cfg = replace(cfg, dry_run=True)
+    logging.basicConfig(
+        level=getattr(logging, cfg.log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
+    )
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
+    log = logging.getLogger("main")
 
-    # ------------------------------------------------------------------ util
-    def _save_trades(self):
-        self.state.put("trades", self.trades)
+    async with aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(limit=50),
+        headers={"User-Agent": "bingx-cbc-bot/2.0"},
+    ) as session:
+        tg = Telegram(session, cfg.telegram_token, cfg.telegram_chat_ids, cfg.dry_run)
 
-    def _release_opening(self, sym):
-        """Libera la reserva placeholder si la apertura no se completo."""
-        with self._trade_lock:
-            tr = self.trades.get(sym)
-            if tr and tr.get("opening"):
-                self.trades.pop(sym, None)
-                self._save_trades()
-
-    def label(self):
-        return {"signals": "SEÑAL", "demo": "DEMO", "live": "LIVE"}[self.cfg.mode]
-
-    # ------------------------------------------------------------------ arranque
-    def startup(self):
-        c = self.cfg
-        log.info("Modo=%s | base URL=%s | TF=%s | estado=%s (persistente=%s)",
-                 c.mode, self.bx.base, c.timeframe, self.state.path, self.state.persistent)
-        if self.trading:
-            miss = c.missing_for_trading()
-            if miss:
-                raise SystemExit(f"Faltan variables para operar: {', '.join(miss)}")
-            if c.mode == "live":
-                problems = c.live_problems()
-                if problems:
-                    raise SystemExit(f"TRADE_MODE=live bloqueado: {'; '.join(problems)}")
-            self.bx.balance()                         # valida credenciales ya
-            try:
-                if not self.bx.position_mode():
-                    log.warning("Cuenta en modo one-way: activo hedge (requiere sin posiciones abiertas)")
-                    self.bx.set_position_mode(True)
-            except BingXError as e:
-                log.error("No pude fijar modo hedge: %s", e)
-            self.reconcile()
-        self.refresh_universe(force=True)
-        self.tg.send(
-            f"🤖 <b>LCE bot iniciado</b> [{self.label()}]\n"
-            f"TF {c.timeframe} · HTF {c.htf if c.use_htf else 'off'} · {len(self.universe)} símbolos\n"
-            f"Endpoint: {esc(self.bx.base)}\n"
-            f"Riesgo {c.risk_pct}% · Lev {c.leverage}x · Máx pos {c.max_positions} ({c.max_per_side}/sentido)\n"
-            f"Protecciones: régimen {c.regime_symbol if c.regime_filter else 'off'} · pérdida diaria {c.max_day_loss}% · "
-            f"pausa tras {c.max_cons_loss} pérdidas · kill_switch {'ON' if c.kill_switch else 'off'}\n"
-            f"Preset: {c.preset} · config {c.fingerprint()}\n"
-            + (f"Variables fijadas: {', '.join(c.active_env()[:14])}\n" if c.active_env() else "Variables de estrategia: todas por defecto\n")
-            +
-            f"Estado persistente: {'sí' if self.state.persistent else 'NO (monta un Volume)'}"
-            + (f"\n♻️ Configuración cambiada: estadísticas en vivo reiniciadas.\nAnteriores: {self.cfg_changed}"
-               if self.cfg_changed else ""))
-
-    def reconcile(self):
-        """Compara trades guardados con posiciones reales del exchange."""
-        live = {(p["symbol"], p["side"]): p for p in self.bx.positions()}
-        for sym, tr in list(self.trades.items()):
-            if (sym, tr["side"]) not in live:
-                log.warning("Trade %s guardado pero sin posicion real -> cierro registro", sym)
-                self._finish_trade(sym, tr, reason="reconciliacion")
-        known = {(s, t["side"]) for s, t in self.trades.items()}
-        orphans = [k for k in live if k not in known]
-        if orphans:
-            self.tg.send("⚠️ Posiciones abiertas sin registro del bot (no las gestiono): "
-                         + ", ".join(f"{s} {d}" for s, d in orphans))
-
-    # ------------------------------------------------------------------ universo
-    def refresh_universe(self, force=False):
-        c = self.cfg
-        if not force and time.time() < self._uni_exp:
+        if args.test_telegram:
+            ok = await tg.send("✅ <b>Prueba</b>: el bot MapleStax CBC puede escribir en este chat.")
+            log.info("Mensaje de prueba %s", "enviado" if ok else "FALLÓ")
             return
-        info = {}
-        for ct in self.bx.contracts():
-            sym = str(ct.get("symbol", ""))
-            if not sym.endswith("-USDT"):
-                continue
-            if str(ct.get("apiStateOpen", "true")).lower() != "true" or int(ct.get("status", 1) or 1) != 1:
-                continue
-            if any(sym.upper().startswith(p) for p in c.non_crypto_prefixes):
-                continue
-            info[sym] = {"pp": int(ct.get("pricePrecision", 4) or 4),
-                         "qp": int(ct.get("quantityPrecision", 0) or 0),
-                         "min_qty": float(ct.get("tradeMinQuantity", 0) or 0),
-                         "min_usdt": float(ct.get("tradeMinUSDT", 0) or 0)}
-        vols = {}
-        try:
-            for t in self.bx.tickers():
-                vols[t.get("symbol")] = float(t.get("quoteVolume") or 0)
-        except (BingXError, ValueError) as e:
-            log.warning("tickers no disponibles: %s", e)
-        wanted = None
-        if c.symbols.upper() != "ALL":
-            wanted = {s.strip().upper().replace("USDT", "-USDT") if "-" not in s else s.strip().upper()
-                      for s in c.symbols.split(",") if s.strip()}
-        syms = [s for s in info if wanted is None or s in wanted]
-        if wanted is None and vols:
-            syms = [s for s in syms if vols.get(s, 0) >= c.min_quote_volume]
-        syms.sort(key=lambda s: -vols.get(s, 0))
-        self.info, self.vol, self.universe = info, vols, syms[:c.max_symbols]
-        self._uni_exp = time.time() + 3600
-        log.info("Universo: %d simbolos (de %d contratos)", len(self.universe), len(info))
 
-    # ------------------------------------------------------------------ analisis (hilos)
-    def _get_htf(self, sym):
-        c = self.cfg
-        bucket = int(time.time() * 1000) // c.htf_ms
-        cached = self._htf_cache.get(sym)
-        if cached and cached[0] == bucket:
-            return cached[1]
-        d = to_dict(self.bx.klines(sym, c.htf, 300), c.htf_ms)
-        self._htf_cache[sym] = (bucket, d)
-        return d
+        bingx = BingXClient(session, cfg.requests_per_second)
+        tracker = Tracker(cfg)
+        scanner = Scanner(cfg, bingx, tg, tracker)
 
-    def analyze_symbol(self, sym):
-        c = self.cfg
-        try:
-            d = to_dict(self.bx.klines(sym, c.timeframe, c.candles), c.bar_ms)
-            if d is None or len(d["t"]) < 120:
-                return sym, "pocas_velas", None, None
-            if int(time.time() * 1000) - (int(d["t"][-1]) + c.bar_ms) > 2 * c.bar_ms:
-                return sym, "datos_viejos", None, None
-            htf = self._get_htf(sym) if c.use_htf else None
-            mt = 10.0 ** (-self.info.get(sym, {}).get("pp", 8))
-            return sym, "ok", strategy.run(c, d, htf, mintick=mt), d
-        except Exception as e:                        # un simbolo malo no tumba el ciclo
-            log.warning("analisis %s fallo: %s", sym, e)
-            return sym, "error", None, None
-
-    # ------------------------------------------------------------------ escaneo
-    def scan(self):
-        """Analiza simbolos en paralelo (solo lectura); ordenes y senales se procesan en serie.
-
-        Asi se cumple el contrato del bot: un solo hilo toca el exchange / self.trades,
-        evitando condiciones de carrera al abrir varias operaciones a la vez.
-        """
-        c = self.cfg
-        t0 = time.time()
-        self.refresh_universe()
-        funnel = Counter()
-        events = []
-        pending_signals = []   # (sym, sig) a manejar en serie tras el analisis
-        manage_actions = []    # (kind, sym, an) gestion de posiciones abiertas
-        extra = set(self.trades) | self.stats.open_symbols()
-        syms = list(self.universe) + [x for x in extra if x not in self.universe and x in self.info]
-        with ThreadPoolExecutor(max_workers=c.workers) as ex:
-            futs = [ex.submit(self.analyze_symbol, s_) for s_ in syms]
-            for fut in as_completed(futs):
-                if self._stop.is_set():
-                    break
-                try:
-                    sym, status, an, d = fut.result()
-                except Exception:  # noqa: BLE001
-                    log.exception("futuro de analisis fallo")
-                    funnel["error"] += 1
-                    continue
-                funnel[status] += 1
-                if status != "ok":
-                    continue
-                events.extend(self.stats.update(sym, d, c.signal_timeout_bars))
-                if not self._hist_done:
-                    self._hist_syms += 1
-                    for hs in an.signals:
-                        self.hist.add(hs, d, an.n, c.signal_timeout_bars)
-                dg = an.diag
-                funnel["brk"] += bool(dg.get("brk"))
-                funnel["rev"] += bool(dg.get("rev"))
-                funnel["cand"] += bool(dg.get("cand"))
-                funnel["cooldown"] += bool(dg.get("cooldown"))
-                if dg.get("blocked"):
-                    funnel["bloq_" + dg["blocked"]] += 1
-                if c.use_struct_exit and sym in self.trades:
-                    manage_actions.append(("struct", sym, an))
-                if c.use_trail and sym in self.trades:
-                    manage_actions.append(("trail", sym, an))
-                if an.signals and an.signals[-1].idx == an.n - 1:
-                    funnel["senales"] += 1
-                    pending_signals.append((sym, an.signals[-1]))
-
-        # --- serie: gestion de posiciones y senales nuevas (un solo hilo) ---
-        for kind, sym, an in manage_actions:
-            if self._stop.is_set():
+        # Reintenta el arranque (BingX / red) en vez de morir
+        for attempt in range(1, 6):
+            try:
+                await scanner.refresh_universe()
                 break
-            try:
-                if kind == "struct":
-                    tr = self.trades.get(sym)
-                    if tr and ((tr["side"] == "LONG" and an.struct_break_dn) or
-                               (tr["side"] == "SHORT" and an.struct_break_up)):
-                        self.close_trade(sym, "estructura rota en contra")
-                elif kind == "trail":
-                    self.trail_trade(sym, an)
-            except Exception:  # noqa: BLE001
-                log.exception("gestion %s %s", kind, sym)
+            except Exception as e:
+                log.error("Arranque intento %d/5 falló: %s", attempt, e)
+                if attempt == 5:
+                    raise
+                await asyncio.sleep(10 * attempt)
 
-        for sym, sig in pending_signals:
-            if self._stop.is_set():
-                break
-            try:
-                self.handle_signal(sym, sig)
-            except Exception:  # noqa: BLE001
-                log.exception("handle_signal %s", sym)
-
-        self.send_events(events)
-        if not self._hist_done:
-            self._hist_done = True
-            self.tg.send(self.hist.text(c.candles * c.bar_ms / 86_400_000, self._hist_syms))
-        self.cycles += 1
-        self.funnel_total.update(funnel)
-        log.info("Ciclo %d en %.1fs | %s", self.cycles, time.time() - t0, dict(funnel))
-
-    # ------------------------------------------------------------------ senales
-    def send_events(self, events):
-        if not events:
+        if args.once:
+            await scanner.scan_once(once=True)
             return
-        def one(e):
-            ico = {"win": "✅", "loss": "❌", "expired": "⌛"}[e["result"]]
-            txt = {"win": "TP alcanzado", "loss": "SL alcanzado", "expired": "expirada sin resolver"}[e["result"]]
-            r = f" {e['r']:+.2f}R" if e["result"] != "expired" else ""
-            return f"{ico} {esc(e['sym'])} {e['side']} {e['kind']} · {txt}{r}"
-        lines = [one(e) for e in events]
-        if len(lines) > 6:
-            lines = lines[:6] + [f"… y {len(lines) - 6} más"]
-        self.tg.send("\n".join(lines) + "\n📊 " + self.stats.summary())
 
-    def format_signal(self, sym, sig):
-        c = self.cfg
-        pp = self.info.get(sym, {}).get("pp", 6)
-        pct = lambda x: abs(x - sig.entry) / sig.entry * 100
-        names = {"BO": "Ruptura", "RV": "Reversión en zona", "SW": "Barrido de liquidez"}
-        when = datetime.fromtimestamp((sig.time + c.bar_ms) / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        arrow = "🟢" if sig.side == "LONG" else "🔴"
-        lines = [f"{arrow} <b>{sig.side}</b> · <b>{esc(sym)}</b> · {c.timeframe} [{self.label()}]",
-                 f"Tipo: {names[sig.kind]} ({sig.kind})" + (f" · puntos {sig.score}" if c.use_score or c.size_by_score else ""),
-                 f"🕒 {when}",
-                 f"Entrada: <code>{fmt_num(sig.entry, pp)}</code>",
-                 f"🛑 SL: <code>{fmt_num(sig.sl, pp)}</code> (-{pct(sig.sl):.2f}%)",
-                 f"🎯 TP: <code>{fmt_num(sig.tp, pp)}</code> (+{pct(sig.tp):.2f}%)"]
-        if sig.tp1:
-            lines.append(f"🎯 TP1: <code>{fmt_num(sig.tp1, pp)}</code> ({c.tp1_pct:.0f}% de la posición)")
-        lines.append(f"R:R {sig.rr:.2f} · ATR {fmt_num(sig.atr, pp)}")
-        lines.append(f"HTF {c.htf}: {sig.htf} · Vol rel {sig.rel_vol:.1f}x · ADX {sig.adx:.0f}")
-        lines.append(f"Riesgo {c.risk_pct * sig.risk_mult:.2f}% del equity" + (f" · Lev {c.leverage}x" if self.trading else ""))
-        lines.append("📊 " + self.stats.summary())
-        h = self.hist
-        if h.w + h.l:
-            lines.append(f"🧪 Backtest reciente: {fmt_wr(h.w, h.l)} · R neto {h.nw - h.nl:+.1f}")
-        return "\n".join(lines)
+        n_c, oil, n_other = scanner.universe_summary()
+        await tg.send(format_startup(cfg, n_c, oil, n_other))
+        log.info("Bot en marcha. LTF=%s HTF=%s", cfg.ltf, cfg.htf)
 
-    def handle_signal(self, sym, sig):
-        if sig.time <= self.sig_ts.get(sym, 0):
-            return
-        self.sig_ts[sym] = sig.time
-        self.state.put("signals", self.sig_ts)
-        self.signals_sent += 1
-        self.stats.add_open(sym, sig)
-        msg = self.format_signal(sym, sig)
-        self.tg.send(msg)
-        if self.trading:
+        loop = asyncio.get_running_loop()
+        task = asyncio.ensure_future(scanner.run())
+        for sig in (signal.SIGINT, signal.SIGTERM):  # Railway envía SIGTERM al redeploy
             try:
-                self.open_trade(sym, sig)
-            except BingXError as e:
-                log.error("open_trade %s: %s", sym, e)
-                self.tg.send(f"⛔ No ejecutada {esc(sym)}: {esc(e)}")
-
-    # ------------------------------------------------------------------ ejecucion
-    def _skip(self, sym, key, detail=""):
-        """Operacion omitida por una proteccion: solo log + contador (el resumen va en el heartbeat)."""
-        self.skipped[key] += 1
-        log.info("%s no ejecutada: %s %s", sym, key, detail)
-
-    def regime(self):
-        """Regimen de BTC en el TF superior: bull / bear / neutral (None si no hay datos)."""
-        c = self.cfg
+                loop.add_signal_handler(sig, task.cancel)
+            except NotImplementedError:  # Windows
+                pass
         try:
-            d = self._get_htf(c.regime_symbol)
-        except BingXError:
-            return None
-        if d is None or len(d["t"]) < c.ema_slow + 2:
-            return None
-        ef, es = ind.ema(d["c"], c.ema_fast)[-1], ind.ema(d["c"], c.ema_slow)[-1]
-        px = d["c"][-1]
-        if ef > es and px > es:
-            return "bull"
-        if ef < es and px < es:
-            return "bear"
-        return "neutral"
-
-    def _exit_side(self, side):
-        return "SELL" if side == "LONG" else "BUY"
-
-    def _place_exit(self, sym, side, kind, qty, price):
-        inf = self.info[sym]
-        typ = "STOP_MARKET" if kind == "SL" else "TAKE_PROFIT_MARKET"
-        for attempt in range(3):
-            try:
-                o = self.bx.place_order(symbol=sym, side=self._exit_side(side), positionSide=side, type=typ,
-                                        quantity=fmt_num(qty, inf["qp"]), stopPrice=fmt_num(price, inf["pp"]),
-                                        workingType="MARK_PRICE")
-                oid = o.get("orderId")
-                if oid:
-                    return str(oid)
-                log.error("%s %s sin orderId: %s", kind, sym, o)
-            except BingXError as e:
-                log.error("%s %s intento %d: %s", kind, sym, attempt + 1, e)
-            time.sleep(0.6 * (attempt + 1))
-        return None
-
-    def _close_market(self, sym, side, qty):
-        inf = self.info[sym]
-        return self.bx.place_order(symbol=sym, side=self._exit_side(side), positionSide=side, type="MARKET",
-                                   quantity=fmt_num(qty, inf["qp"]))
-
-    def _confirm_fill(self, sym, side, oid):
-        """Devuelve (precio_medio, cantidad) SOLO si de verdad se lleno."""
-        for _ in range(8):
-            time.sleep(0.5)
-            try:
-                o = self.bx.get_order(sym, oid)
-            except BingXError:
-                continue
-            st = str(o.get("status", "")).upper()
-            qty = float(o.get("executedQty") or 0)
-            if st in ("CANCELED", "CANCELLED", "FAILED", "EXPIRED", "REJECTED"):
-                return None
-            if st in ("FILLED", "PARTIALLY_FILLED") and qty > 0:
-                return float(o.get("avgPrice") or 0), qty
-        for p in self.bx.positions(sym):                 # ultimo recurso: la posicion real
-            if p["side"] == side and p["amt"] > 0:
-                return p["avg"], p["amt"]
-        return None
-
-    def open_trade(self, sym, sig):
-        """Reserva el hueco bajo lock y ejecuta la orden fuera del lock (red no bloquea gestion)."""
-        c = self.cfg
-        inf = self.info.get(sym)
-        if inf is None:
-            return
-        if c.kill_switch:
-            return self._skip(sym, "kill_switch")
-        with self._trade_lock:
-            if sym in self.trades or self.trades.get(sym) is not None:
-                log.info("%s ya tiene operacion abierta", sym)
-                return
-            if len(self.trades) >= c.max_positions:
-                return self._skip(sym, "max_posiciones", f"({c.max_positions})")
-            if c.max_per_side and sum(1 for t_ in self.trades.values() if t_["side"] == sig.side) >= c.max_per_side:
-                return self._skip(sym, "max_por_sentido", f"({sig.side} {c.max_per_side})")
-            # reserva placeholder para que otro hilo no tome el mismo hueco
-            self.trades[sym] = {"side": sig.side, "kind": sig.kind, "opening": True, "opened": time.time()}
-            self._save_trades()
-        try:
-            self._open_trade_body(sym, sig, inf)
-        except Exception:
-            with self._trade_lock:
-                tr = self.trades.get(sym)
-                if tr and tr.get("opening"):
-                    self.trades.pop(sym, None)
-                    self._save_trades()
-            raise
-
-    def _open_trade_body(self, sym, sig, inf):
-        """Coloca la orden de entrada y SL/TP. El hueco ya esta reservado en self.trades."""
-        c = self.cfg
-        if c.regime_filter:
-            rg = self.regime()
-            if rg is None:
-                self._release_opening(sym); return self._skip(sym, "regimen_desconocido")
-            if (sig.side == "LONG" and rg == "bear") or (sig.side == "SHORT" and rg == "bull"):
-                self._release_opening(sym); return self._skip(sym, "contra_regimen_BTC", f"({sig.side} con BTC {rg})")
-        bal = self.bx.balance()
-        ok, why = self.risk.can_open(bal["equity"])
-        if not ok:
-            self._release_opening(sym); return self._skip(sym, "limite_riesgo", why)
-        px = self.bx.price(sym)
-        if px <= 0:
-            self._release_opening(sym)
-            return
-        sl_pct = abs(px - sig.sl) / px * 100.0
-        lims = [x for x in (c.max_sl_pct, c.max_sl_liq_frac * 100.0 / c.leverage if c.max_sl_liq_frac > 0 and c.leverage > 0 else 0) if x > 0]
-        if lims and sl_pct > min(lims):
-            self._release_opening(sym); return self._skip(sym, "sl_demasiado_lejos", f"(SL {sl_pct:.1f}% > {min(lims):.1f}%)")
-        sgn = 1 if sig.side == "LONG" else -1
-        risk_d = (px - sig.sl) * sgn
-        reward = (sig.tp - px) * sgn
-        if risk_d <= 0 or reward <= 0 or reward / risk_d < c.min_live_rr:
-            self._release_opening(sym); return self._skip(sym, "precio_movido", f"(R:R real {reward / risk_d if risk_d > 0 else 0:.2f})")
-        sz = size_position(bal["equity"], px, sig.sl, c.risk_pct * sig.risk_mult, c.max_lev, inf["qp"], inf["min_qty"], inf["min_usdt"])
-        if not sz:
-            self._release_opening(sym); return self._skip(sym, "tamano_minimo")
-        if sz["notional"] / c.leverage > bal["available"] * 0.95:
-            self._release_opening(sym); return self._skip(sym, "margen_insuficiente")
-        qty = sz["qty"]
-        n1 = 0.0
-        if c.use_partial and sig.tp1:
-            n1 = round_down(qty * c.tp1_pct / 100.0, inf["qp"])
-            if n1 < inf["min_qty"] or qty - n1 < inf["min_qty"] or n1 <= 0:
-                n1 = 0.0
-
-        # apalancamiento en AMBOS lados (hedge) y margen aislado, una vez por simbolo
-        if sym not in self._lev_done:
-            for s in ("LONG", "SHORT"):
-                try:
-                    self.bx.set_leverage(sym, s, c.leverage)
-                except BingXError as e:
-                    log.warning("leverage %s %s: %s", sym, s, e)
-            self._lev_done.add(sym)
-        if sym not in self._mt_done:
-            try:
-                self.bx.set_margin_type(sym, "ISOLATED")
-            except BingXError as e:
-                log.info("marginType %s: %s", sym, e)
-            self._mt_done.add(sym)
-
-        o = self.bx.place_order(symbol=sym, side="BUY" if sgn > 0 else "SELL", positionSide=sig.side,
-                                type="MARKET", quantity=fmt_num(qty, inf["qp"]))
-        oid = o.get("orderId")
-        fill = self._confirm_fill(sym, sig.side, oid) if oid else None
-        if not fill:
-            self.tg.send(f"⛔ {esc(sym)}: la orden de entrada NO se confirmó como ejecutada")
-            self._release_opening(sym)
-            return
-        avg, fqty = fill
-        fqty = round_down(fqty, inf["qp"])
-
-        sl_id = self._place_exit(sym, sig.side, "SL", fqty, sig.sl)
-        if not sl_id:                                   # sin SL no se queda abierta
-            try:
-                self._close_market(sym, sig.side, fqty)
-            except BingXError as e:
-                log.error("cierre de emergencia %s fallo: %s", sym, e)
-            self.tg.send(f"🚨 {esc(sym)}: no pude colocar el SL; posición cerrada por seguridad")
-            self._release_opening(sym)
-            return
-        tp_id = tp1_id = None
-        if n1 > 0 and fqty - n1 > 0:
-            tp1_id = self._place_exit(sym, sig.side, "TP", n1, sig.tp1)
-            tp_id = self._place_exit(sym, sig.side, "TP", round_down(fqty - n1, inf["qp"]), sig.tp)
-        else:
-            n1 = 0.0
-            tp_id = self._place_exit(sym, sig.side, "TP", fqty, sig.tp)
-        if not tp_id:
-            self.tg.send(f"⚠️ {esc(sym)}: SL puesto pero NO pude colocar el TP; revisa la posición")
-
-        self.trades[sym] = {
-            "side": sig.side, "kind": sig.kind, "entry": avg, "sl": sig.sl, "tp": sig.tp, "tp1": sig.tp1 if n1 else None,
-            "qty": fqty, "n1": n1, "atr": sig.atr, "risk_d": abs(avg - sig.sl), "opened": time.time(),
-            "risk_usdt": sz["risk_usdt"], "sl_id": sl_id, "tp_id": tp_id, "tp1_id": tp1_id, "tp1_done": False, "trail_ts": 0.0,
-        }
-        self._save_trades()
-        self.risk.on_open()
-        self.tg.send(f"✅ <b>{self.label()} abierta</b> {sig.side} {esc(sym)}\n"
-                     f"Qty {fmt_num(fqty, inf['qp'])} @ {fmt_num(avg, inf['pp'])} · riesgo ≈ {sz['risk_usdt']:.2f} USDT\n"
-                     f"SL {'✔' if sl_id else '✖'} · TP {'✔' if tp_id else '✖'}")
-
-    # ------------------------------------------------------------------ gestion
-    def _replace_sl(self, sym, tr, new_sl, qty):
-        inf = self.info[sym]
-        new_id = self._place_exit(sym, tr["side"], "SL", qty, new_sl)
-        if not new_id:
-            return False
-        old = tr.get("sl_id")
-        tr["sl_id"], tr["sl"] = new_id, new_sl
-        if old:
-            try:
-                self.bx.cancel_order(sym, old)
-            except BingXError as e:
-                log.info("cancel SL viejo %s: %s", sym, e)
-        return True
-
-    def trail_trade(self, sym, an):
-        """Trailing de Pine: SL = max(SL, hh3 - ATR*trailATR) (short: min(SL, ll3 + ATR*trailATR)), por vela cerrada."""
-        c = self.cfg
-        tr = self.trades.get(sym)
-        if not tr or not self.trading or math.isnan(an.hh3) or math.isnan(an.atr):
-            return
-        if c.use_partial and tr.get("n1") and not tr["tp1_done"]:
-            return
-        if tr["side"] == "LONG":
-            new = max(tr["sl"], an.hh3 - an.atr * c.trail_atr)
-            ok = new > tr["sl"] and new < an.last_close
-        else:
-            new = min(tr["sl"], an.ll3 + an.atr * c.trail_atr)
-            ok = new < tr["sl"] and new > an.last_close
-        if not ok:
-            return
-        try:
-            pos = [p for p in self.bx.positions(sym) if p["side"] == tr["side"]]
-            if pos and self._replace_sl(sym, tr, new, round_down(pos[0]["amt"], self.info[sym]["qp"])):
-                self._save_trades()
-        except BingXError as e:
-            log.warning("trail %s: %s", sym, e)
-
-    def _finish_trade(self, sym, tr, reason=""):
-        pnl = None
-        try:
-            pnl = self.bx.income(sym, int(tr["opened"] * 1000) - 1000) if self.trading else None
-        except BingXError as e:
-            log.warning("income %s: %s", sym, e)
-        if self.trading:
-            try:
-                self.bx.cancel_all(sym)
-            except BingXError as e:
-                log.info("cancel_all %s: %s", sym, e)
-        self.trades.pop(sym, None)
-        self._save_trades()
-        paused = False
-        if pnl is not None:
-            paused = bool(self.risk.on_close(pnl, tr.get("risk_usdt", 0.0)))
-        r = (pnl / (tr["risk_d"] * tr["qty"])) if pnl is not None and tr.get("risk_d") and tr.get("qty") else None
-        msg = (f"🏁 <b>Cerrada</b> {tr['side']} {esc(sym)} {('· ' + reason) if reason else ''}\n"
-               + (f"PnL realizado: {pnl:+.2f} USDT" + (f" ({r:+.2f} R)" if r is not None else "")
-                  if pnl is not None else "PnL: no disponible"))
-        if paused:
-            mins = max(1, int(self.cfg.pause_bars * self.cfg.bar_ms / 60_000))
-            msg += (f"\n⏸ <b>Pausa automática</b> ~{mins} min tras "
-                    f"{self.cfg.max_cons_loss} pérdidas seguidas. No se abrirán nuevas operaciones.")
-        self.tg.send(msg)
-
-    def close_trade(self, sym, reason):
-        tr = self.trades.get(sym)
-        if not tr:
-            return
-        try:
-            pos = [p for p in self.bx.positions(sym) if p["side"] == tr["side"]]
-            if pos:
-                self._close_market(sym, tr["side"], pos[0]["amt"])
-        except BingXError as e:
-            log.error("close_trade %s: %s", sym, e)
-            self.tg.send(f"🚨 No pude cerrar {esc(sym)} ({esc(e)}). Revisa manualmente.")
-            return
-        time.sleep(1.0)
-        self._finish_trade(sym, tr, reason)
-
-    def manage(self):
-        if not self.trades:
-            return
-        c = self.cfg
-        try:
-            live = {(p["symbol"], p["side"]): p for p in self.bx.positions()}
-        except BingXError as e:
-            log.warning("manage: positions fallo: %s", e)
-            return
-        with self._trade_lock:
-            items = list(self.trades.items())
-        for sym, tr in items:
-            if self._stop.is_set():
-                return
-            pos = live.get((sym, tr["side"]))
-            if pos is None:
-                if time.time() - tr["opened"] > 20:      # margen para que aparezca tras abrir
-                    self._finish_trade(sym, tr, "SL/TP")
-                continue
-            try:
-                inf = self.info.get(sym, {"qp": 0, "pp": 6})
-                # sincroniza cantidad real (parciales del exchange / redondeos)
-                real_qty = round_down(pos["amt"], inf["qp"])
-                if real_qty > 0 and abs(real_qty - tr.get("qty", 0)) > 10 ** (-max(inf["qp"], 0) - 1):
-                    tr["qty"] = real_qty
-                    self._save_trades()
-                if c.max_bars and (time.time() - tr["opened"]) / (c.bar_ms / 1000) >= c.max_bars:
-                    self.close_trade(sym, f"stop por tiempo ({c.max_bars} velas)")
-                    continue
-                if tr.get("n1") and not tr["tp1_done"] and pos["amt"] <= tr["qty"] - tr["n1"] * 0.999:
-                    tr["tp1_done"] = True
-                    self.tg.send(f"🎯 TP1 alcanzado {esc(sym)}")
-                    if c.use_be:
-                        be = tr["entry"]
-                        if self._replace_sl(sym, tr, be, round_down(pos["amt"], inf["qp"])):
-                            self.tg.send(f"🔒 SL a break-even {esc(sym)}")
-                    self._save_trades()
-            except BingXError as e:
-                log.warning("manage %s: %s", sym, e)
-
-    # ------------------------------------------------------------------ bucle
-    def heartbeat_if_due(self):
-        c = self.cfg
-        if c.heartbeat_hours <= 0 or time.time() - self._last_hb < c.heartbeat_hours * 3600:
-            return
-        self._last_hb = time.time()
-        f = self.funnel_total
-        equity = None
-        eq = ""
-        if self.trading:
-            try:
-                equity = self.bx.balance()["equity"]
-                self.risk.update_equity(equity)
-                eq = f"\nEquity: {equity:.2f} USDT · {self.risk.summary(equity)}"
-            except BingXError:
-                eq = f"\n{self.risk.summary()}"
-        self.tg.send(
-            f"💓 LCE [{self.label()}] · ciclos {self.cycles} · señales {self.signals_sent} · "
-            f"abiertas {len(self.trades)}{eq}\n"
-            f"📊 {self.stats.summary()}\n"
-            f"🛡 Omitidas: {dict(self.skipped) or 'ninguna'}\n"
-            f"Embudo: ok {f['ok']} · cand {f['cand']} · cooldown {f['cooldown']} · "
-            f"sin_espacio {f['bloq_sin_espacio']} · errores {f['error']} · viejos {f['datos_viejos']}"
-        )
-        self.funnel_total = Counter()
-        self.skipped = Counter()
-
-    def run(self):
-        c = self.cfg
-        self.startup()
-
-        def _stop_handler(signum, _frame):
-            name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
-            log.warning("Senal %s recibida -> apagado limpio", name)
-            self._stop.set()
-
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                signal.signal(sig, _stop_handler)
-            except (ValueError, OSError):
-                pass  # no disponible en todos los entornos (p.ej. hilos secundarios)
-
-        bar_s = c.bar_ms / 1000.0
-        nxt = (int(time.time() // bar_s) + 1) * bar_s + c.scan_delay
-        if c.scan_on_start:
-            nxt = time.time()
-        last_manage = 0.0
-        while not self._stop.is_set():
-            try:
-                now = time.time()
-                if now >= nxt:
-                    self.scan()
-                    nxt = (int(time.time() // bar_s) + 1) * bar_s + c.scan_delay
-                if self.trading and time.time() - last_manage >= c.manage_interval:
-                    self.manage()
-                    last_manage = time.time()
-                self.heartbeat_if_due()
-            except Exception as e:                       # noqa: BLE001 - el bucle no debe morir
-                log.exception("error en bucle principal")
-                if time.time() - self._last_err_msg > 900:
-                    self._last_err_msg = time.time()
-                    self.tg.send(f"⚠️ Error en el bot: {esc(repr(e)[:300])}")
-            # sleep interrumpible para reaccionar rapido a SIGTERM
-            self._stop.wait(timeout=1.0)
-        log.info("Bot detenido limpiamente tras %d ciclos", self.cycles)
-        try:
-            self.tg.send(f"🛑 LCE [{self.label()}] detenido tras {self.cycles} ciclos · abiertas {len(self.trades)}")
-        except Exception:  # noqa: BLE001
-            pass
+            await task
+        except asyncio.CancelledError:
+            log.info("Apagando…")
+        finally:
+            tracker.save()
 
 
-def idle(msg):
-    """Tras un backtest/volcado el servicio queda en espera (evita reinicios en bucle)."""
-    while True:
-        log.info(msg)
-        time.sleep(3600)
-
-
-def main():
-    cfg = Config()
-    logging.basicConfig(level=getattr(logging, cfg.log_level, logging.INFO),
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s", stream=sys.stdout)
-    if cfg.strategy == "qs":
-        from qs_bot import QSBot
-        bot_cls = QSBot
-    else:
-        bot_cls = Bot
-    if cfg.run_mode in ("backtest", "dump"):
-        if cfg.strategy == "qs":
-            import qs_bot as bt_mod
-            fns = (bt_mod.run_backtest, bt_mod.run_dump)
-        else:
-            import backtest as bt_mod
-            fns = (bt_mod.run_sweep, bt_mod.run_dump)
-        bot = bot_cls(cfg)
-        try:
-            (fns[0] if cfg.run_mode == "backtest" else fns[1])(bot)
-        except Exception as e:                       # noqa: BLE001
-            log.exception("fallo en %s", cfg.run_mode)
-            bot.tg.send(f"⛔ Error en {cfg.run_mode}: {esc(repr(e)[:300])}")
-        bot.tg.send("ℹ️ Terminado. Cambia RUN_MODE=bot en Railway para volver a las señales en vivo.")
-        idle(f"RUN_MODE={cfg.run_mode} terminado; pon RUN_MODE=bot")
-    else:
-        bot_cls(cfg).run()
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Bot de señales MapleStax CBC para BingX -> Telegram")
+    ap.add_argument("--once", action="store_true", help="analiza una vez y termina")
+    ap.add_argument("--dry-run", action="store_true", help="no envía a Telegram, imprime en consola")
+    ap.add_argument("--test-telegram", action="store_true", help="envía un mensaje de prueba")
+    args = ap.parse_args()
+    try:
+        asyncio.run(amain(args))
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

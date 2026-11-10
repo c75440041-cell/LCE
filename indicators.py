@@ -1,132 +1,139 @@
-"""Indicadores equivalentes a las funciones ta.* de Pine Script (numpy puro)."""
-import numpy as np
-from numpy.lib.stride_tricks import sliding_window_view
+"""Indicadores y lógica CBC portados del Pine Script "MapleStax CBC v2.00".
+
+Todo es CAUSAL (cada valor solo usa datos hasta esa vela), así que el mismo código
+sirve para el bot en vivo y para el backtest sin sesgo de mirar al futuro.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import List, Sequence
+
+NAN = float("nan")
 
 
-def _first_valid(x):
-    idx = np.flatnonzero(~np.isnan(x))
-    return int(idx[0]) if idx.size else -1
-
-
-def sma(x, n):
-    x = np.asarray(x, float)
-    out = np.full(x.shape, np.nan)
-    if len(x) >= n:
-        out[n - 1:] = sliding_window_view(x, n).mean(axis=1)
+def ema(values: Sequence[float], period: int) -> List[float]:
+    """EMA estilo Pine ta.ema (semilla = primer valor)."""
+    alpha = 2.0 / (period + 1.0)
+    out: List[float] = []
+    prev = None
+    for x in values:
+        prev = x if prev is None else alpha * x + (1.0 - alpha) * prev
+        out.append(prev)
     return out
 
 
-def _smooth(x, n, alpha):
-    """EMA/RMA con semilla SMA (igual que Pine)."""
-    x = np.asarray(x, float)
-    out = np.full(x.shape, np.nan)
-    s = _first_valid(x)
-    if s < 0 or len(x) - s < n:
+def atr_wilder(h: Sequence[float], l: Sequence[float], c: Sequence[float], period: int = 14) -> List[float]:
+    """ATR con suavizado de Wilder (ta.atr / RMA)."""
+    n = len(c)
+    out = [NAN] * n
+    if n < period or n == 0:
         return out
-    out[s + n - 1] = x[s:s + n].mean()
-    for i in range(s + n, len(x)):
-        out[i] = alpha * x[i] + (1.0 - alpha) * out[i - 1]
+    tr = [h[0] - l[0]]
+    for i in range(1, n):
+        tr.append(max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])))
+    a = sum(tr[:period]) / period
+    out[period - 1] = a
+    for i in range(period, n):
+        a = (a * (period - 1) + tr[i]) / period
+        out[i] = a
     return out
 
 
-def ema(x, n):
-    return _smooth(x, n, 2.0 / (n + 1))
-
-
-def rma(x, n):
-    return _smooth(x, n, 1.0 / n)
-
-
-def true_range(h, l, c):
-    h, l, c = (np.asarray(a, float) for a in (h, l, c))
-    pc = np.roll(c, 1)
-    tr = np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
-    tr[0] = h[0] - l[0]
-    return tr
-
-
-def atr(h, l, c, n):
-    return rma(true_range(h, l, c), n)
-
-
-def stdev(x, n):
-    x = np.asarray(x, float)
-    out = np.full(x.shape, np.nan)
-    if len(x) >= n:
-        out[n - 1:] = sliding_window_view(x, n).std(axis=1)   # poblacional, como Pine
+def vwap_daily(t: Sequence[int], h: Sequence[float], l: Sequence[float],
+               c: Sequence[float], v: Sequence[float]) -> List[float]:
+    """VWAP de hlc3 reiniciado cada día UTC (equivale a ta.vwap(hlc3) en mercado 24/7)."""
+    out: List[float] = []
+    day = None
+    pv = vv = tp_sum = 0.0
+    cnt = 0
+    for i in range(len(t)):
+        d = t[i] // 86_400_000
+        if d != day:
+            day = d
+            pv = vv = tp_sum = 0.0
+            cnt = 0
+        tp = (h[i] + l[i] + c[i]) / 3.0
+        pv += tp * v[i]
+        vv += v[i]
+        tp_sum += tp
+        cnt += 1
+        out.append(pv / vv if vv > 0 else tp_sum / cnt)
     return out
 
 
-def highest(x, n):
-    x = np.asarray(x, float)
-    out = np.full(x.shape, np.nan)
-    if len(x) >= n:
-        out[n - 1:] = sliding_window_view(x, n).max(axis=1)
+def cbc_states(h: Sequence[float], l: Sequence[float], c: Sequence[float]) -> List[bool]:
+    """Máquina de estados CBC (idéntica a f_cbc_state del Pine, rupturas estrictas).
+
+    Alcista (True)  -> pasa a bajista si close < low[1]
+    Bajista (False) -> pasa a alcista si close > high[1]
+    """
+    n = len(c)
+    if n == 0:
+        return []
+    state = False
+    out = [False]
+    for i in range(1, n):
+        if state and c[i] < l[i - 1]:
+            state = False
+        elif (not state) and c[i] > h[i - 1]:
+            state = True
+        out.append(state)
     return out
 
 
-def lowest(x, n):
-    x = np.asarray(x, float)
-    out = np.full(x.shape, np.nan)
-    if len(x) >= n:
-        out[n - 1:] = sliding_window_view(x, n).min(axis=1)
+def rel_volume(v: Sequence[float], n: int = 20) -> List[float]:
+    """Volumen relativo = volumen / media de las n velas ANTERIORES."""
+    out = [NAN] * len(v)
+    for i in range(n, len(v)):
+        avg = sum(v[i - n:i]) / n
+        out[i] = v[i] / avg if avg > 0 else NAN
     return out
 
 
-def shift(x, k=1):
-    x = np.asarray(x, float)
-    out = np.full(x.shape, np.nan)
-    if k < len(x):
-        out[k:] = x[:-k]
+def trend_efficiency(c: Sequence[float], n: int = 20) -> List[float]:
+    """Eficiencia direccional (Kaufman) CON SIGNO, en [-1, 1]. Causal.
+
+    (c[i] - c[i-n]) / suma(|Δc|) de las últimas n velas.
+    ~0 = lateral / ruido · +1 = subida limpia · -1 = bajada limpia. Antes de n velas devuelve 0.
+    """
+    out = [0.0] * len(c)
+    if n < 1 or len(c) <= n:
+        return out
+    diffs = [0.0] + [abs(c[k] - c[k - 1]) for k in range(1, len(c))]
+    for i in range(n, len(c)):
+        path = sum(diffs[i - n + 1:i + 1])
+        out[i] = (c[i] - c[i - n]) / path if path > 1e-12 else 0.0
     return out
 
 
-def rsi(c, n):
-    c = np.asarray(c, float)
-    d = np.diff(c, prepend=np.nan)
-    up = np.where(np.isnan(d), np.nan, np.maximum(d, 0.0))
-    dn = np.where(np.isnan(d), np.nan, np.maximum(-d, 0.0))
-    ru, rd = rma(up, n), rma(dn, n)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        out = 100.0 - 100.0 / (1.0 + ru / rd)
-    out = np.where((rd == 0) & ~np.isnan(ru), 100.0, out)
+@dataclass
+class Bucket:
+    key: int
+    o: float
+    h: float
+    l: float
+    c: float
+    first: int
+    last: int
+
+
+def bucketize(t: Sequence[int], o: Sequence[float], h: Sequence[float], l: Sequence[float],
+              c: Sequence[float], bucket_ms: int) -> List[Bucket]:
+    """Agrupa velas LTF en velas HTF alineadas a la época UTC (igual que BingX)."""
+    out: List[Bucket] = []
+    for i in range(len(t)):
+        k = t[i] // bucket_ms
+        if out and out[-1].key == k:
+            b = out[-1]
+            b.h = max(b.h, h[i])
+            b.l = min(b.l, l[i])
+            b.c = c[i]
+            b.last = i
+        else:
+            out.append(Bucket(k, o[i], h[i], l[i], c[i], i, i))
     return out
 
 
-def dmi(h, l, c, n=14):
-    h, l, c = (np.asarray(a, float) for a in (h, l, c))
-    up = h - np.roll(h, 1)
-    dn = np.roll(l, 1) - l
-    plus = np.where((up > dn) & (up > 0), up, 0.0)
-    minus = np.where((dn > up) & (dn > 0), dn, 0.0)
-    plus[0] = minus[0] = np.nan
-    tr = true_range(h, l, c)
-    tr[0] = np.nan
-    a = rma(tr, n)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        dip = 100.0 * rma(plus, n) / a
-        dim = 100.0 * rma(minus, n) / a
-        s = dip + dim
-        dx = 100.0 * np.abs(dip - dim) / np.where(s == 0, np.nan, s)
-    return dip, dim, rma(dx, n)
-
-
-def pivot_high(x, left, right):
-    """out[i] = valor del pivote (barra i-right) confirmado en la barra i."""
-    x = np.asarray(x, float)
-    out = np.full(x.shape, np.nan)
-    for i in range(left + right, len(x)):
-        w = x[i - left - right:i + 1]
-        if x[i - right] == w.max():
-            out[i] = x[i - right]
-    return out
-
-
-def pivot_low(x, left, right):
-    x = np.asarray(x, float)
-    out = np.full(x.shape, np.nan)
-    for i in range(left + right, len(x)):
-        w = x[i - left - right:i + 1]
-        if x[i - right] == w.min():
-            out[i] = x[i - right]
-    return out
+def is_nan(x: float) -> bool:
+    return x is None or (isinstance(x, float) and math.isnan(x))
